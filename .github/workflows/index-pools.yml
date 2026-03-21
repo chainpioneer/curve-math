@@ -1,0 +1,70 @@
+name: Index Pools
+
+on:
+  schedule:
+    - cron: '0 6 * * *'  # Daily at 6am UTC
+  workflow_dispatch:       # Manual trigger
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  index:
+    name: Discover & Verify Pools
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python deps
+        run: pip install web3 toml
+
+      - name: Discover new pools
+        env:
+          RPC_URL_1: ${{ secrets.RPC_URL_1 }}
+        run: |
+          if [ -z "$RPC_URL_1" ]; then
+            echo "::warning::RPC_URL_1 not set, skipping"
+            exit 0
+          fi
+          python tools/index-pools.py --chain-id 1 --min-tvl 1000000 --max-new 10
+
+      - name: Fuzz new pools only
+        if: hashFiles('registry/1_pending.toml') != ''
+        env:
+          RPC_URL_1: ${{ secrets.RPC_URL_1 }}
+          FUZZ_ITERATIONS: "100"
+        run: |
+          cargo test --features swap --test fuzz_registry -- fuzz_1_pending --ignored --nocapture
+          # If fuzz passes, remove pending file (pools already in main registry)
+          rm -f registry/1_pending.toml
+
+      - name: Read PR summary
+        id: summary
+        run: |
+          if [ -f .pr-summary.md ]; then
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+            echo "body<<EOF" >> $GITHUB_OUTPUT
+            cat .pr-summary.md >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+            rm .pr-summary.md
+          else
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create PR if changes
+        if: steps.summary.outputs.has_changes == 'true'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          commit-message: "Update pool registry (auto-indexed)"
+          title: "Update pool registry"
+          body: ${{ steps.summary.outputs.body }}
+          branch: auto/index-pools
+          delete-branch: true
