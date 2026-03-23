@@ -56,7 +56,7 @@ async fn read_pool_coins(
 ) -> Option<(usize, Vec<u8>)> {
     let c = ICoinInfo::new(addr, provider);
     let mut decimals = Vec::new();
-    for i in 0..4u64 {
+    for i in 0..8u64 {
         let coin_result = match c.coins(U256::from(i)).block(block).call().await {
             Ok(v) => Ok(v),
             Err(_) => {
@@ -105,6 +105,10 @@ alloy::sol! {
         function balances(uint256 i) external view returns (uint256);
         function A() external view returns (uint256);
         function fee() external view returns (uint256);
+        function initial_A() external view returns (uint256);
+        function future_A() external view returns (uint256);
+        function initial_A_time() external view returns (uint256);
+        function future_A_time() external view returns (uint256);
     }
 
     #[sol(rpc)]
@@ -395,10 +399,20 @@ async fn build_pool(
             for i in 0..n_coins {
                 balances.push(c.balances(U256::from(i)).block(block).call().await.ok()?);
             }
-            let raw_a = c.A().block(block).call().await.ok()?;
+            // Prefer initial_A when no ramping (avoids A() integer division precision loss).
+            // When ramping is active (initial_A != future_A), fall back to A() * A_PRECISION.
+            let amp = match (
+                c.initial_A().block(block).call().await,
+                c.future_A().block(block).call().await,
+            ) {
+                (Ok(ia), Ok(fa)) if ia == fa => ia,
+                _ => {
+                    let raw_a = c.A().block(block).call().await.ok()?;
+                    raw_a * a_prec_100
+                }
+            };
             let fee = c.fee().block(block).call().await.ok()?;
             let rates: Vec<U256> = decimals.iter().map(|d| rate_for_decimals(*d)).collect();
-            let amp = raw_a * a_prec_100;
             Some((
                 Pool::StableSwapV2 {
                     balances,
@@ -698,10 +712,11 @@ async fn build_pool(
 // ── Shared fuzz runner ───────────────────────────────────────────────────────
 
 async fn fuzz_pools(label: &str, pools: &[PoolEntry]) {
-    let chain_id: u64 = std::env::var("FUZZ_CHAIN_ID")
-        .unwrap_or_else(|_| "1".into())
-        .parse()
-        .unwrap();
+    // Extract chain ID from label (e.g. "chain 8453 pending" → 8453)
+    let chain_id: u64 = label
+        .split_whitespace()
+        .find_map(|w| w.parse().ok())
+        .unwrap_or(1);
     let env_key = format!("RPC_URL_{chain_id}");
     let rpc_url = std::env::var(&env_key)
         .or_else(|_| std::env::var("RPC_URL"))
@@ -835,4 +850,29 @@ async fn fuzz_1_pending() {
         return;
     }
     fuzz_pools("chain 1 pending", &pools).await;
+}
+
+/// Fuzz all Base pools.
+#[tokio::test]
+#[ignore = "requires RPC_URL_8453"]
+async fn fuzz_8453() {
+    let pools = load_registry("registry/8453.toml");
+    fuzz_pools("chain 8453", &pools).await;
+}
+
+/// Pending fuzz for Base.
+#[tokio::test]
+#[ignore = "requires RPC_URL_8453"]
+async fn fuzz_8453_pending() {
+    let path = "registry/8453_pending.toml";
+    if !std::path::Path::new(path).exists() {
+        println!("No pending pools at {path}");
+        return;
+    }
+    let pools = load_registry(path);
+    if pools.is_empty() {
+        println!("No pending pools");
+        return;
+    }
+    fuzz_pools("chain 8453 pending", &pools).await;
 }

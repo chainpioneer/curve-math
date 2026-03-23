@@ -4,8 +4,8 @@ Curve pool indexer — discovers pools from on-chain factories, verifies with fu
 
 Usage:
     pip install web3 toml
-    python tools/index-pools.py --chain-id 1 --min-tvl 5000000 --max-new 10
-    python tools/index-pools.py --chain-id 1 --min-tvl 5000000 --dry-run
+    python tools/index-pools.py --chain-id 1 --max-new 20
+    python tools/index-pools.py --chain-id 1 --max-new 20 --dry-run
 """
 
 import argparse
@@ -63,13 +63,46 @@ FACTORIES = {
             "label": "crvUSD StableSwap Factory",
         },
     ],
+    8453: [  # Base
+        {
+            "address": "0xd2002373543Ce3527023C75e7518C274A51ce712",
+            "variant": "StableSwapNG",
+            "label": "StableSwap-NG",
+        },
+        {
+            "address": "0xc9Fe0C63Af9A39402e8a5514f9c43Af0322b665F",
+            "variant": "TwoCryptoNG",
+            "label": "TwoCrypto-NG",
+        },
+        {
+            "address": "0xA5961898870943c68037F6848d2D866Ed2016bcB",
+            "variant": "TriCryptoNG",
+            "label": "TriCrypto-NG",
+        },
+        # ── Legacy factories ──────────────────────────────────────────
+        {
+            "address": "0x5EF72230578b3e399E6C6F4F6360edF95e83BBfd",
+            "variant": "TwoCryptoV1",
+            "label": "CryptoSwap Factory (legacy)",
+        },
+        {
+            "address": "0x3093f9B57A428F3EB6285a589cb35bEA6e78c336",
+            "variant": "auto",
+            "label": "StableSwap Factory (legacy, 15 pools)",
+        },
+        {
+            "address": "0x87DD13Dd25a1DBde0E1EdcF5B8Fa6cfff7eABCaD",
+            "variant": "auto",
+            "label": "StableSwap Factory (legacy, 725 pools)",
+        },
+    ],
 }
 
 # ── Minimal ABIs ─────────────────────────────────────────────────────────────
 
 FACTORY_ABI = json.loads('[{"name":"pool_count","outputs":[{"type":"uint256"}],"inputs":[],"stateMutability":"view","type":"function"},{"name":"pool_list","outputs":[{"type":"address"}],"inputs":[{"type":"uint256"}],"stateMutability":"view","type":"function"},{"name":"is_meta","outputs":[{"type":"bool"}],"inputs":[{"type":"address"}],"stateMutability":"view","type":"function"},{"name":"get_base_pool","outputs":[{"type":"address"}],"inputs":[{"type":"address"}],"stateMutability":"view","type":"function"}]')
 
-POOL_ABI = json.loads('[{"name":"coins","outputs":[{"type":"address"}],"inputs":[{"type":"uint256"}],"stateMutability":"view","type":"function"},{"name":"balances","outputs":[{"type":"uint256"}],"inputs":[{"type":"uint256"}],"stateMutability":"view","type":"function"},{"name":"A","outputs":[{"type":"uint256"}],"inputs":[],"stateMutability":"view","type":"function"},{"name":"fee","outputs":[{"type":"uint256"}],"inputs":[],"stateMutability":"view","type":"function"}]')
+POOL_ABI = json.loads('[{"name":"coins","outputs":[{"type":"address"}],"inputs":[{"type":"uint256"}],"stateMutability":"view","type":"function"},{"name":"balances","outputs":[{"type":"uint256"}],"inputs":[{"type":"uint256"}],"stateMutability":"view","type":"function"},{"name":"A","outputs":[{"type":"uint256"}],"inputs":[],"stateMutability":"view","type":"function"},{"name":"fee","outputs":[{"type":"uint256"}],"inputs":[],"stateMutability":"view","type":"function"},{"name":"N_COINS","outputs":[{"type":"uint256"}],"inputs":[],"stateMutability":"view","type":"function"}]')
 
 TOKEN_ABI = json.loads('[{"name":"decimals","outputs":[{"type":"uint8"}],"inputs":[],"stateMutability":"view","type":"function"},{"name":"symbol","outputs":[{"type":"string"}],"inputs":[],"stateMutability":"view","type":"function"}]')
 
@@ -183,7 +216,7 @@ def detect_variant_onchain(w3, addr, block):
     return "StableSwapV2"
 
 
-def discover_pools(w3, factory_cfg, existing_addrs, min_tvl, max_new, block):
+def discover_pools(w3, factory_cfg, existing_addrs, max_new, block):
     """Discover new pools from a factory contract."""
     factory = w3.eth.contract(
         address=Web3.to_checksum_address(factory_cfg["address"]),
@@ -258,26 +291,37 @@ def discover_pools(w3, factory_cfg, existing_addrs, min_tvl, max_new, block):
     if not live_pools:
         return []
 
-    # Step 3: batch fetch coin details for live pools (limit to max_new)
+    # Step 3: fetch N_COINS for each pool, then batch fetch coin details
     tvl_passed = live_pools[:max_new]
+    ncoin_calls = [(pool_contracts[a], "N_COINS", []) for a in tvl_passed]
+    ncoin_results = _batch_call(w3, ncoin_calls, block)
+    pool_ncoins = {}
+    for addr, n in zip(tvl_passed, ncoin_results):
+        pool_ncoins[addr] = n if n and n > 0 else 4  # fallback to 4 for legacy
+
     detail_calls = []
+    detail_layout = []  # (addr, n_coins) to reconstruct results
     for addr in tvl_passed:
         pc = pool_contracts[addr]
-        for ci in range(4):  # up to 4 coins
+        n = pool_ncoins[addr]
+        for ci in range(n):
             detail_calls.append((pc, "coins", [ci]))
             detail_calls.append((pc, "balances", [ci]))
+        detail_layout.append((addr, n))
     detail_results = _batch_call(w3, detail_calls, block)
 
     # Step 4: batch fetch decimals/symbols for coins
     coin_addrs = {}
-    for pi, addr in enumerate(tvl_passed):
+    offset = 0
+    for addr, n in detail_layout:
         coins_for_pool = []
-        for ci in range(4):
-            base = pi * 8 + ci * 2
+        for ci in range(n):
+            base = offset + ci * 2
             coin_addr = detail_results[base]
             if coin_addr and coin_addr != "0x" + "0" * 40:
                 coins_for_pool.append((coin_addr, detail_results[base + 1]))
         coin_addrs[addr] = coins_for_pool
+        offset += n * 2
 
     # Batch decimals/symbols
     token_calls = []
@@ -345,7 +389,7 @@ def discover_pools(w3, factory_cfg, existing_addrs, min_tvl, max_new, block):
             variant = detect_variant_onchain(w3, addr, block)
 
         name = "/".join(symbols)
-        print(f"    {addr} {name} ({len(coins)}-coin, ~${tvl:,}, {variant})")
+        print(f"    {addr} {name} ({len(coins)}-coin, {variant})")
         candidates.append({
             "address": addr,
             "variant": variant,
@@ -391,8 +435,7 @@ def verify_pool_quick(w3, pool_entry, block) -> tuple[bool, str]:
 def main():
     parser = argparse.ArgumentParser(description="Curve pool indexer")
     parser.add_argument("--chain-id", type=int, default=1)
-    parser.add_argument("--min-tvl", type=int, default=1_000_000, help="Minimum TVL in USD (rough estimate)")
-    parser.add_argument("--max-new", type=int, default=10, help="Max new pools to analyze per run")
+    parser.add_argument("--max-new", type=int, default=20, help="Max new pools to add per run")
     parser.add_argument("--dry-run", action="store_true", help="Don't write registry file")
     args = parser.parse_args()
 
@@ -410,20 +453,19 @@ def main():
     existing = {p["address"].lower() for p in registry["pools"]}
     print(f"  {len(existing)} existing pools")
 
-    # Discover
-    all_candidates = []
+    # Count total factory pools across all factories
     total_factory_pools = 0
     for factory in FACTORIES[args.chain_id]:
-        remaining = args.max_new - len(all_candidates)
-        if remaining <= 0:
-            break
-        candidates = discover_pools(w3, factory, existing, args.min_tvl, remaining, block)
-        all_candidates.extend(candidates)
-        # Count total pools in factory
         fc = w3.eth.contract(address=Web3.to_checksum_address(factory["address"]), abi=FACTORY_ABI)
         total_factory_pools += fc.functions.pool_count().call(block_identifier=block)
 
-    print(f"\n{len(all_candidates)} new candidates above ${args.min_tvl:,} TVL")
+    # Discover — take up to max_new from EACH factory for even coverage
+    all_candidates = []
+    for factory in FACTORIES[args.chain_id]:
+        candidates = discover_pools(w3, factory, existing, args.max_new, block)
+        all_candidates.extend(candidates)
+
+    print(f"\n{len(all_candidates)} new live candidates")
 
     if not all_candidates:
         print("No new pools to add.")
@@ -482,7 +524,7 @@ def main():
 
         # Update verified pool count in README
         pool_count = len(registry["pools"])
-        update_readme_badge(pool_count, registry["last_updated"], total_factory_pools)
+        update_readme_badge(args.chain_id, pool_count, registry["last_updated"], total_factory_pools)
 
         # Write PR summary for CI
         write_pr_summary(verified, failed, added_names, skipped_names)
@@ -508,20 +550,28 @@ def write_pr_summary(verified: int, failed: int, added: list[str], skipped: list
     print(f"PR summary written to .pr-summary.md")
 
 
-def update_readme_badge(count: int, last_updated: str, total: int = 0):
-    """Update the chain status table in README.md."""
+CHAIN_NAMES = {1: "Ethereum", 8453: "Base"}
+CHAIN_FUZZ_BADGES = {
+    1: "[![Fuzz](https://github.com/sunce86/curve-math/actions/workflows/fuzz-ethereum.yml/badge.svg)](https://github.com/sunce86/curve-math/actions/workflows/fuzz-ethereum.yml)",
+}
+
+
+def update_readme_badge(chain_id: int, count: int, last_updated: str, total: int = 0):
+    """Update the chain status table row for the given chain in README.md."""
     readme = Path("README.md")
     if not readme.exists():
         return
     content = readme.read_text()
 
     import re
-    # Update Ethereum row in chain status table
+    chain_name = CHAIN_NAMES.get(chain_id, f"Chain {chain_id}")
+    badge = CHAIN_FUZZ_BADGES.get(chain_id, "")
     pct = (count * 100 // total) if total else 0
     pool_str = f"{count} / {total} ![](https://geps.dev/progress/{pct}?successColor=6366f1)" if total else str(count)
+    new_row = f"| {chain_name} | {badge} | {pool_str} | {last_updated} |"
     content = re.sub(
-        r'\| Ethereum \|.*\|.*\|.*\|',
-        f'| Ethereum | [![Fuzz](https://github.com/sunce86/curve-math/actions/workflows/fuzz-ethereum.yml/badge.svg)](https://github.com/sunce86/curve-math/actions/workflows/fuzz-ethereum.yml) | {pool_str} | {last_updated} |',
+        rf'\| {re.escape(chain_name)} \|.*\|.*\|.*\|',
+        new_row,
         content,
     )
     readme.write_text(content)
