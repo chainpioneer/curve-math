@@ -18,10 +18,12 @@
 //! 1. `stored_rates()` → **StableSwapNG** (all NG pools, including v5+ crvUSD
 //!    factory pools that lack `offpeg_fee_multiplier()`)
 //! 2. `offpeg_fee_multiplier()` without `stored_rates()` → **StableSwapALend**
-//! 3. `base_pool()` → **StableSwapMeta**
-//! 4. `balances(int128)` → **StableSwapV0**
-//! 5. Known address → **StableSwapV0** / **StableSwapV1**
-//! 6. Fallback → **StableSwapV2**
+//! 3. `version()` → **StableSwapNG** (v6+ crvUSD factory pools that lack both
+//!    `stored_rates()` and `offpeg_fee_multiplier()`)
+//! 4. `base_pool()` → **StableSwapMeta**
+//! 5. `balances(int128)` → **StableSwapV0**
+//! 6. Known address → **StableSwapV0** / **StableSwapV1**
+//! 7. Fallback → **StableSwapV2**
 //!
 //! # Limitations
 //!
@@ -52,6 +54,7 @@ use crate::CurveVariant;
 /// math_version          ← call version() on the MATH address
 /// has_offpeg_fee_multiplier ← call offpeg_fee_multiplier()
 /// has_stored_rates       ← call stored_rates()
+/// has_version            ← call version() on the pool itself
 /// has_base_pool          ← call base_pool()
 /// has_int128_balances    ← call balances(int128(0))
 /// ```
@@ -77,6 +80,12 @@ pub struct ProbingResults {
     /// including v5+ crvUSD factory pools that lack `offpeg_fee_multiplier()`.
     /// ALend does not have this.
     pub has_stored_rates: bool,
+
+    /// Pool has `version()` getter → NG-era pool (v5+, v6+, v7+).
+    /// All NG pools have this. Legacy (V0/V1/V2/Meta/ALend) do not.
+    /// Catches v6+ crvUSD factory pools that lack both `stored_rates()`
+    /// and `offpeg_fee_multiplier()`.
+    pub has_version: bool,
 
     /// Pool has `base_pool()` → StableSwapMeta.
     /// Note: MetaPool Factory proxy pools lack this getter.
@@ -160,6 +169,12 @@ fn detect_stableswap(probing: &ProbingResults) -> CurveVariant {
         return CurveVariant::StableSwapALend;
     }
 
+    // version() → NG (covers v6+ crvUSD factory pools that lack both
+    // stored_rates and offpeg_fee_multiplier)
+    if probing.has_version {
+        return CurveVariant::StableSwapNG;
+    }
+
     // base_pool() → Meta
     if probing.has_base_pool {
         return CurveVariant::StableSwapMeta;
@@ -225,6 +240,7 @@ mod tests {
             math_version: None,
             has_offpeg_fee_multiplier: false,
             has_stored_rates: false,
+            has_version: false,
             has_base_pool: false,
             has_int128_balances: false,
             pool_address: addr("0xD51a44d3FaE010294C616388b506AcdA1bfAAE46"),
@@ -241,6 +257,7 @@ mod tests {
             math_version: None,
             has_offpeg_fee_multiplier: false,
             has_stored_rates: false,
+            has_version: false,
             has_base_pool: false,
             has_int128_balances: false,
             pool_address: addr("0x7F86Bf177Dd4F3494b841a37e810A34dD56c829B"),
@@ -257,6 +274,7 @@ mod tests {
             math_version: Some("v2.0.0".to_string()),
             has_offpeg_fee_multiplier: false,
             has_stored_rates: false,
+            has_version: false,
             has_base_pool: false,
             has_int128_balances: false,
             pool_address: addr("0xfb8b95Fb2296a0Ad4b6b1419fdAA5AA5F13e4009"),
@@ -273,6 +291,7 @@ mod tests {
             math_version: Some("v2.1.0".to_string()),
             has_offpeg_fee_multiplier: false,
             has_stored_rates: false,
+            has_version: false,
             has_base_pool: false,
             has_int128_balances: false,
             pool_address: Address::ZERO,
@@ -289,6 +308,7 @@ mod tests {
             math_version: Some("v0.1.0".to_string()),
             has_offpeg_fee_multiplier: false,
             has_stored_rates: false,
+            has_version: false,
             has_base_pool: false,
             has_int128_balances: false,
             pool_address: addr("0x6e5492F8ea2370844EE098A56DD88e1717e4A9C2"),
@@ -308,6 +328,7 @@ mod tests {
             math_version: None,
             has_offpeg_fee_multiplier: false,
             has_stored_rates: false,
+            has_version: false,
             has_base_pool: false,
             has_int128_balances: false,
             pool_address: addr("0x8301AE4fc9c624d1D396cbDAa1ed877821D7C511"),
@@ -324,6 +345,7 @@ mod tests {
             math_version: Some("v3.0.0".to_string()),
             has_offpeg_fee_multiplier: false,
             has_stored_rates: false,
+            has_version: false,
             has_base_pool: false,
             has_int128_balances: false,
             pool_address: Address::ZERO,
@@ -341,6 +363,7 @@ mod tests {
             math_version: None,
             has_offpeg_fee_multiplier: false,
             has_stored_rates: false,
+            has_version: false,
             has_base_pool: false,
             has_int128_balances: false,
             pool_address: Address::ZERO,
@@ -357,6 +380,7 @@ mod tests {
             math_version: None,
             has_offpeg_fee_multiplier: true,
             has_stored_rates: true,
+            has_version: true,
             has_base_pool: false,
             has_int128_balances: false,
             pool_address: addr("0xF36a4BA50C603204c3FC6d2dA8b78A7b69CBC67d"),
@@ -377,9 +401,31 @@ mod tests {
             math_version: None,
             has_offpeg_fee_multiplier: false,
             has_stored_rates: true,
+            has_version: true,
             has_base_pool: false,
             has_int128_balances: false,
             pool_address: addr("0x1539c2461d7432cc114b0903f1824079BfCA2C92"),
+        };
+        assert_eq!(
+            detect_variant(&probing).unwrap(),
+            CurveVariant::StableSwapNG
+        );
+    }
+
+    #[test]
+    fn detect_stableswap_ng_via_version() {
+        // v6.0.1 crvUSD factory pool: has version() but no stored_rates, no offpeg
+        let probing = ProbingResults {
+            has_gamma: false,
+            n_coins: 3,
+            has_math: false,
+            math_version: None,
+            has_offpeg_fee_multiplier: false,
+            has_stored_rates: false,
+            has_version: true,
+            has_base_pool: false,
+            has_int128_balances: false,
+            pool_address: addr("0x4DEcE678ceceb27446b35C672dC7d61F30bAD69E"),
         };
         assert_eq!(
             detect_variant(&probing).unwrap(),
@@ -396,6 +442,7 @@ mod tests {
             math_version: None,
             has_offpeg_fee_multiplier: true,
             has_stored_rates: false,
+            has_version: false,
             has_base_pool: false,
             has_int128_balances: false,
             pool_address: addr("0xDeBF20617708857ebe4F679508E7b7863a8A8EeE"),
@@ -415,6 +462,7 @@ mod tests {
             math_version: None,
             has_offpeg_fee_multiplier: false,
             has_stored_rates: false,
+            has_version: false,
             has_base_pool: true,
             has_int128_balances: false,
             pool_address: addr("0x4f062658EaAF2C1ccf8C8e36D6824CDf41167956"),
@@ -434,6 +482,7 @@ mod tests {
             math_version: None,
             has_offpeg_fee_multiplier: false,
             has_stored_rates: false,
+            has_version: false,
             has_base_pool: false,
             has_int128_balances: true,
             pool_address: addr("0xA5407eAE9Ba41422680e2e00537571bcC53efBfD"),
@@ -454,6 +503,7 @@ mod tests {
             math_version: None,
             has_offpeg_fee_multiplier: false,
             has_stored_rates: false,
+            has_version: false,
             has_base_pool: false,
             has_int128_balances: false,
             pool_address: addr("0xA5407eAE9Ba41422680e2e00537571bcC53efBfD"),
@@ -473,6 +523,7 @@ mod tests {
             math_version: None,
             has_offpeg_fee_multiplier: false,
             has_stored_rates: false,
+            has_version: false,
             has_base_pool: false,
             has_int128_balances: false,
             pool_address: addr("0xbEbc44782C7dB0a1A60Cb6fe97d0b483032FF1C7"),
@@ -492,6 +543,7 @@ mod tests {
             math_version: None,
             has_offpeg_fee_multiplier: false,
             has_stored_rates: false,
+            has_version: false,
             has_base_pool: false,
             has_int128_balances: false,
             pool_address: addr("0xDcEF968d416a41Cdac0ED8702fAC8128A64241A2"),
