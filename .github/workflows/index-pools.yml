@@ -35,7 +35,7 @@ jobs:
             echo "::warning::RPC_URL_1 not set, skipping"
             exit 0
           fi
-          python ../curve-math/tools/index-pools.py --chain-id 1 --max-new 10
+          python ../curve-math/tools/index-pools.py --chain-id 1 --max-new 30
 
       - name: Fuzz new pools only
         if: hashFiles('crates/curve-adapter/tests/registry/1_pending.toml') != ''
