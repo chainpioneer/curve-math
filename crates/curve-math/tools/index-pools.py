@@ -495,17 +495,19 @@ def main():
     existing = {p["address"].lower() for p in registry["pools"]}
     print(f"  {len(existing)} existing pools")
 
-    # Count total factory pools across all factories
+    # Count total and live factory pools across all factories
     total_factory_pools = 0
+    total_live_new = 0
+    all_candidates = []
     for factory in FACTORIES[args.chain_id]:
         fc = w3.eth.contract(address=Web3.to_checksum_address(factory["address"]), abi=FACTORY_ABI)
         total_factory_pools += fc.functions.pool_count().call(block_identifier=block)
-
-    # Discover — take up to max_new from EACH factory for even coverage
-    all_candidates = []
-    for factory in FACTORIES[args.chain_id]:
         candidates = discover_pools(w3, factory, existing, args.max_new, block)
         all_candidates.extend(candidates)
+        total_live_new += len(candidates)
+
+    # Live pools = already registered + newly discovered live pools
+    live_pool_count = len(existing) + total_live_new
 
     print(f"\n{len(all_candidates)} new live candidates")
 
@@ -513,8 +515,11 @@ def main():
         print("No new pools to add.")
         registry["last_updated"] = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         registry["total_factory_pools"] = total_factory_pools
+        registry["live_factory_pools"] = live_pool_count
         if not args.dry_run:
             write_registry(registry_path, registry)
+            pool_count = len(registry["pools"])
+            update_readme_badge(args.chain_id, pool_count, registry["last_updated"], live_pool_count)
         return
 
     # Save original pool list for diff
@@ -561,12 +566,13 @@ def main():
         # Also update main registry (will be committed together)
         registry["last_updated"] = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         registry["total_factory_pools"] = total_factory_pools
+        registry["live_factory_pools"] = live_pool_count
         write_registry(registry_path, registry)
         print(f"Registry updated: {registry_path}")
 
         # Update verified pool count in README
         pool_count = len(registry["pools"])
-        update_readme_badge(args.chain_id, pool_count, registry["last_updated"], total_factory_pools)
+        update_readme_badge(args.chain_id, pool_count, registry["last_updated"], live_pool_count)
 
         # Write PR summary for CI
         write_pr_summary(verified, failed, added_names, skipped_names)
