@@ -1,4 +1,4 @@
-name: Fuzz Ethereum
+name: Fuzz Base
 
 on:
   push:
@@ -23,7 +23,7 @@ env:
 
 jobs:
   fuzz:
-    name: Registry Fuzz (Chain 1)
+    name: Registry Fuzz (Chain 8453)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -31,11 +31,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Run registry fuzz
         env:
-          RPC_URL_1: ${{ secrets.RPC_URL_1 }}
+          RPC_URL_8453: ${{ secrets.RPC_URL_8453 }}
           FUZZ_ITERATIONS: "100"
         run: |
-          if [ -z "$RPC_URL_1" ]; then
-            echo "::warning::RPC_URL_1 not set, skipping fuzz"
+          if [ -z "$RPC_URL_8453" ]; then
+            echo "::warning::RPC_URL_8453 not set, skipping fuzz"
             exit 0
           fi
-          cargo test -p curve-adapter --test fuzz_registry -- fuzz_1 --ignored --nocapture --test-threads=1
+          cargo test -p curve-adapter --test fuzz_registry -- fuzz_8453 --ignored --nocapture --test-threads=1
