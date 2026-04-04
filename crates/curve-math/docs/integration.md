@@ -63,16 +63,6 @@ The registry is maintained by the [pool indexer](../tools/index-pools.py) and co
 
 Each variant requires different on-chain state. Some fields change every block, others rarely.
 
-### Balance validation
-
-A pool's internal `balances(i)` can diverge from the actual token balance held by the contract (`ERC20(coins(i)).balanceOf(pool)`). This happens on drained, exploited, or abandoned pools — the internal accounting remains stale while the tokens are gone.
-
-On such pools, `get_dy()` returns a mathematically "correct" result based on stale `balances(i)`, but `exchange()` reverts because the contract cannot transfer tokens it doesn't hold.
-
-**Always verify**: for each coin `i`, check that `ERC20(coins(i)).balanceOf(pool) >= balances(i)`. If any coin fails this check, the pool is in an inconsistent state and swap simulations will produce unreliable results.
-
-This applies to all variants, but is most common on legacy CryptoSwap pools (TwoCryptoV1) and old StableSwap deployments.
-
 ### Per-block state (update on every swap/liquidity event)
 
 | Variant | Fields |
@@ -161,66 +151,24 @@ Different variants scale A differently:
 | TwoCryptoV1, TwoCryptoNG, TwoCryptoStable | A * A_MULTIPLIER (10000) | `ann = A()` (already scaled) |
 | TriCryptoV1, TriCryptoNG | A * A_MULTIPLIER (10000) | `ann = A()` (already scaled) |
 
-## Meta Pool Underlying Swaps (LP Unwrap)
+### TwoCryptoV1 `eth_variant` detection
 
-Meta pools (e.g., GUSD/3CRV) trade a meta token against a base pool LP token. On-chain, `exchange_underlying` allows direct swaps between the meta token and base pool underlying coins (e.g., GUSD → USDC).
+`TwoCryptoV1` pools exist in two on-chain implementations with a subtle difference in the Newton solver's `mul2` formula:
 
-`curve-math` provides the building blocks for this as two standalone functions in `swap::stableswap_v1`:
+| Implementation | `eth_variant` | Deployed as |
+|---|---|---|
+| `CurveCryptoSwap2ETH` | `true` | Factory pools + legacy pools with WETH |
+| `CurveCryptoSwap2` | `false` | Legacy non-factory pools without WETH |
 
-| Function | Direction | Description |
-|----------|-----------|-------------|
-| `calc_withdraw_one_coin` | LP → coin | Amount of coin `i` received when burning LP tokens |
-| `calc_add_liquidity` | coin → LP | LP tokens minted when depositing into base pool |
+**Detection rule:**
 
-### Additional state required
+1. **Factory-deployed pools** (from CryptoSwap factory `0xF180...ac99`): always `eth_variant = true`. The factory has a single implementation (`0xa854...ba10`) which uses the ETH formula, regardless of whether the pool contains WETH.
 
-These functions require **`total_supply`** of the base pool LP token, which is not part of the standard pool state:
+2. **Legacy non-factory pools**: `eth_variant = coins.contains(WETH)`. Only ~3 legacy pools on Ethereum mainnet use the non-ETH implementation (e.g., BADGER/WBTC).
 
-| Field | How to fetch | When to update |
-|-------|-------------|----------------|
-| `total_supply` | `ERC20(lp_token).totalSupply()` | Per-block (changes on every add/remove liquidity) |
+**How to identify factory vs legacy:** Factory pools are EIP-1167 minimal proxies (45-byte bytecode starting with `363d3d373d3d3d363d73`). Legacy pools have full bytecode (>20KB). Alternatively, check if the pool address appears in factory `pool_list()`.
 
-The LP token address can be discovered via `pool.token()` (for legacy pools) or from factory deployment events.
-
-### Usage pattern
-
-To simulate `exchange_underlying(0, 2, dx)` on a GUSD/3CRV meta pool:
-
-```rust
-// Step 1: Meta pool swap GUSD → 3CRV LP
-let lp_amount = meta_pool.get_amount_out(0, 1, dx)?;
-
-// Step 2: Base pool withdrawal 3CRV LP → USDC
-let usdc_out = stableswap_v1::calc_withdraw_one_coin(
-    &base_balances, &base_rates, base_amp, base_fee,
-    lp_amount, 1, // coin index 1 = USDC in 3pool
-    base_total_supply,
-)?;
-```
-
-For the reverse direction (USDC → GUSD):
-```rust
-// Step 1: Base pool deposit USDC → 3CRV LP
-let amounts = [U256::ZERO, usdc_amount, U256::ZERO];
-let lp_minted = stableswap_v1::calc_add_liquidity(
-    &base_balances, &base_rates, base_amp, base_fee,
-    &amounts, base_total_supply,
-)?;
-
-// Step 2: Meta pool swap 3CRV LP → GUSD
-let gusd_out = meta_pool.get_amount_out(1, 0, lp_minted)?;
-```
-
-This matches on-chain `exchange_underlying` at wei-level precision because the on-chain implementation literally performs these same two steps as separate contract calls.
-
-### Base pools
-
-Most meta pools use 3pool as base. The base pool address is available via `meta_pool.base_pool()`.
-
-| Base pool | LP token | Coins | Variant |
-|-----------|----------|-------|---------|
-| 3pool (`0xbEbc...FF1C7`) | 3CRV (`0x6c3F...E490`) | DAI, USDC, USDT | StableSwapV1 |
-| sBTC (`0x7fC7...8D85`) | sbtcCrv (`0x075b...B997`) | renBTC, WBTC, sBTC | StableSwapV1 |
+For substreams/streaming: factory pools are discovered via `TwocryptoPoolDeployed` events — these are always `eth_variant = true`. Legacy pools are in the static registry with the flag pre-set.
 
 ## Substreams / Streaming Integration
 
