@@ -17,8 +17,9 @@ fn crypto_fee(xp: &[U256], mid_fee: U256, out_fee: U256, fee_gamma: U256) -> Opt
     for x_i in xp {
         k = k * n * (*x_i) / s;
     }
-    // fee_gamma * WAD / (fee_gamma + WAD - K)
-    // Matches both v2.0.0 and v2.1.0 deployed pool.fee_calc() / get_dy.
+    // V1-style fee: f = fee_gamma * WAD / (fee_gamma + WAD - K)
+    // Matches deployed TwoCryptoNG (v2.0.0/v2.1.0) pool._fee().
+    // Note: TwoCryptoStable (v0.1.0) uses the NG formula instead.
     let f = if fee_gamma > U256::ZERO {
         fee_gamma * wad / (fee_gamma + wad - k)
     } else {

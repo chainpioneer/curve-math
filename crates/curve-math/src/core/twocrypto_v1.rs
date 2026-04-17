@@ -108,6 +108,111 @@ pub fn crypto_fee(xp: &[U256], mid_fee: U256, out_fee: U256, fee_gamma: U256) ->
     Some((mid_fee * f + out_fee * (WAD - f)) / WAD)
 }
 
+/// Geometric mean of 2 values via Newton iteration, matching V1 on-chain.
+/// Port of Vyper `geometric_mean(x, sort)`.
+fn geometric_mean(unsorted_x: [U256; 2], sort: bool) -> U256 {
+    let x = if sort && unsorted_x[0] < unsorted_x[1] {
+        [unsorted_x[1], unsorted_x[0]]
+    } else {
+        unsorted_x
+    };
+    let mut d = x[0];
+    let n = U256::from(2u64);
+    for _ in 0..255u32 {
+        let d_prev = d;
+        d = (d + x[0] * x[1] / d) / n;
+        let diff = if d > d_prev { d - d_prev } else { d_prev - d };
+        if diff <= U256::from(1u64) || diff * WAD < d {
+            return d;
+        }
+    }
+    d
+}
+
+/// Compute the CryptoSwap invariant D using Newton's method (2-coin, V1).
+///
+/// Port of the V1 on-chain `newton_D`. Uses `geometric_mean` for the initial
+/// guess (NOT `isqrt`), matching the deployed V1 contract exactly.
+pub fn newton_d(ann: U256, gamma: U256, x_unsorted: [U256; 2]) -> Option<U256> {
+    let n = U256::from(2u64);
+
+    let x = if x_unsorted[0] < x_unsorted[1] {
+        [x_unsorted[1], x_unsorted[0]]
+    } else {
+        x_unsorted
+    };
+
+    let min_x = U256::from(10u64).pow(U256::from(9u64));
+    let max_x = U256::from(10u64).pow(U256::from(33u64));
+    if x[0] < min_x || x[0] > max_x {
+        return None;
+    }
+    if x[1] * WAD / x[0] < U256::from(10u64).pow(U256::from(14u64)) {
+        return None;
+    }
+
+    // V1 uses geometric_mean for initial guess (NOT isqrt)
+    let mut d = n * geometric_mean(x, false);
+    let s = x[0] + x[1];
+
+    let g1k0_base = gamma + WAD;
+
+    for _ in 0..255u32 {
+        let d_prev = d;
+
+        let k0 = WAD * n * n * x[0] / d * x[1] / d;
+
+        let _g1k0 = if g1k0_base > k0 {
+            g1k0_base - k0 + U256::from(1u64)
+        } else {
+            k0 - g1k0_base + U256::from(1u64)
+        };
+
+        let mul1 = WAD * d / gamma * _g1k0 / gamma * _g1k0 * A_MULTIPLIER / ann;
+        let mul2 = U256::from(2u64) * WAD * n * k0 / _g1k0;
+
+        if k0.is_zero() {
+            return None;
+        }
+        let neg_fprime = (s + s * mul2 / WAD) + mul1 * n / k0 - mul2 * d / WAD;
+
+        if neg_fprime.is_zero() {
+            return None;
+        }
+
+        let d_plus = d * (neg_fprime + s) / neg_fprime;
+        let mut d_minus = d * d / neg_fprime;
+
+        if WAD > k0 {
+            d_minus += d * (mul1 / neg_fprime) / WAD * (WAD - k0) / k0;
+        } else {
+            d_minus -= d * (mul1 / neg_fprime) / WAD * (k0 - WAD) / k0;
+        }
+
+        d = if d_plus > d_minus {
+            d_plus - d_minus
+        } else {
+            (d_minus - d_plus) / U256::from(2u64)
+        };
+
+        let diff = if d > d_prev { d - d_prev } else { d_prev - d };
+
+        let threshold = U256::from(10u64).pow(U256::from(16u64)).max(d);
+        if diff * U256::from(10u64).pow(U256::from(14u64)) < threshold {
+            for &xi in &x {
+                let frac = xi * WAD / d;
+                if frac < U256::from(10u64).pow(U256::from(16u64)) - U256::from(1u64)
+                    || frac > U256::from(10u64).pow(U256::from(20u64)) + U256::from(1u64)
+                {
+                    return None;
+                }
+            }
+            return Some(d);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,5 +273,28 @@ mod tests {
         let fee_i = crypto_fee(&imbalanced, mid_fee, out_fee, fee_gamma).expect("imbalanced");
         // Imbalanced should have higher fee
         assert!(fee_i > fee_b);
+    }
+}
+
+#[cfg(test)]
+mod tests_v1 {
+    use super::*;
+
+    #[test]
+    fn test_newton_y_remove_liquidity_one() {
+        let xp = [
+            U256::from_str_radix("2510169349155793532115", 10).unwrap(),
+            U256::from_str_radix("2585830633075154645790", 10).unwrap(),
+        ];
+        let d_adj = U256::from_str_radix("5095549065851033008468", 10).unwrap();
+        let ann = U256::from(20000000u64);
+        let gamma = U256::from_str_radix("10000000000000000", 10).unwrap();
+
+        let result = newton_y_2(ann, gamma, xp, d_adj, 0, true);
+        println!("newton_y_2 = {:?}", result);
+        assert!(result.is_some(), "newton_y_2 should converge");
+
+        let expected_y = U256::from_str_radix("2509719026343462522930", 10).unwrap();
+        assert_eq!(result.unwrap(), expected_y, "y mismatch");
     }
 }

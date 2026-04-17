@@ -1063,4 +1063,83 @@ impl Pool {
             _ => Err(PoolError::NotApplicable),
         }
     }
+
+    /// Compute the pool invariant D from current state.
+    ///
+    /// - **StableSwap**: computes `xp` from balances × rates, then solves for D
+    ///   using Newton's method. D is not stored in StableSwap pools — it is
+    ///   computed on-the-fly by `get_amount_out`.
+    /// - **CryptoSwap**: computes `xp` from balances × precisions × price_scale,
+    ///   then solves for D via `newton_d`. Returns the same value as the on-chain
+    ///   `D()` storage variable.
+    ///
+    /// Returns `None` if the solver does not converge.
+    pub fn compute_d(&self) -> Option<U256> {
+        use crate::core;
+        let wad = U256::from(10u64).pow(U256::from(18u64));
+        match self {
+            Pool::StableSwapV0 { balances, rates, amp, .. } => {
+                let xp: Vec<U256> = balances.iter().zip(rates).map(|(b, r)| *b * *r / wad).collect();
+                core::stableswap_v0::get_d(&xp, *amp)
+            }
+            Pool::StableSwapV1 { balances, rates, amp, .. } => {
+                let xp: Vec<U256> = balances.iter().zip(rates).map(|(b, r)| *b * *r / wad).collect();
+                core::stableswap_v1::get_d(&xp, *amp)
+            }
+            Pool::StableSwapV2 { balances, rates, amp, .. } => {
+                let xp: Vec<U256> = balances.iter().zip(rates).map(|(b, r)| *b * *r / wad).collect();
+                core::stableswap_v2::get_d(&xp, *amp)
+            }
+            Pool::StableSwapALend { balances, precision_mul, amp, .. } => {
+                let xp: Vec<U256> = balances.iter().zip(precision_mul).map(|(b, p)| *b * *p).collect();
+                core::stableswap_alend::get_d(&xp, *amp)
+            }
+            Pool::StableSwapNG { balances, rates, amp, .. } => {
+                let xp: Vec<U256> = balances.iter().zip(rates).map(|(b, r)| *b * *r / wad).collect();
+                core::stableswap_ng::get_d(&xp, *amp)
+            }
+            Pool::StableSwapMeta { balances, rates, amp, .. } => {
+                let xp: Vec<U256> = balances.iter().zip(rates).map(|(b, r)| *b * *r / wad).collect();
+                core::stableswap_meta::get_d(&xp, *amp)
+            }
+            Pool::TwoCryptoV1 { balances, precisions, price_scale, ann, gamma, .. } => {
+                let xp: [U256; 2] = [
+                    balances[0] * precisions[0],
+                    balances[1] * *price_scale * precisions[1] / wad,
+                ];
+                core::twocrypto_ng::newton_d(*ann, *gamma, xp, U256::ZERO)
+            }
+            Pool::TwoCryptoNG { balances, precisions, price_scale, ann, gamma, .. } => {
+                let xp: [U256; 2] = [
+                    balances[0] * precisions[0],
+                    balances[1] * *price_scale * precisions[1] / wad,
+                ];
+                core::twocrypto_ng::newton_d(*ann, *gamma, xp, U256::ZERO)
+            }
+            Pool::TwoCryptoStable { balances, precisions, price_scale, ann, .. } => {
+                // TwoCryptoStable uses StableSwap math for D (get_d, not newton_d)
+                let xp: [U256; 2] = [
+                    balances[0] * precisions[0],
+                    balances[1] * *price_scale * precisions[1] / wad,
+                ];
+                core::twocrypto_stable::get_d(&xp, *ann)
+            }
+            Pool::TriCryptoV1 { balances, precisions, price_scale, ann, gamma, .. } => {
+                let xp: [U256; 3] = [
+                    balances[0] * precisions[0],
+                    balances[1] * price_scale[0] * precisions[1] / wad,
+                    balances[2] * price_scale[1] * precisions[2] / wad,
+                ];
+                core::tricrypto_ng::newton_d(*ann, *gamma, xp, U256::ZERO)
+            }
+            Pool::TriCryptoNG { balances, precisions, price_scale, ann, gamma, .. } => {
+                let xp: [U256; 3] = [
+                    balances[0] * precisions[0],
+                    balances[1] * price_scale[0] * precisions[1] / wad,
+                    balances[2] * price_scale[1] * precisions[2] / wad,
+                ];
+                core::tricrypto_ng::newton_d(*ann, *gamma, xp, U256::ZERO)
+            }
+        }
+    }
 }

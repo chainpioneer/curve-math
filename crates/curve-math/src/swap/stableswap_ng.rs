@@ -59,6 +59,55 @@ pub fn get_amount_out(
     Some(result)
 }
 
+/// Like `get_amount_out` but also returns the admin fee deduction (in native units).
+/// On-chain: `balances[j] -= dy + dy_admin_fee`.
+pub fn get_amount_out_with_admin_fee(
+    balances: &[U256],
+    rates: &[U256],
+    amp: U256,
+    fee: U256,
+    offpeg_fee_multiplier: U256,
+    i: usize,
+    j: usize,
+    dx: U256,
+) -> Option<(U256, U256)> {
+    if dx.is_zero() {
+        return None;
+    }
+    let precision = U256::from(PRECISION);
+    let admin_fee = U256::from(5_000_000_000u64); // 50%, constant across Curve
+
+    let xp: Vec<U256> = balances
+        .iter()
+        .zip(rates.iter())
+        .map(|(b, r)| *b * *r / precision)
+        .collect();
+
+    let d = get_d(&xp, amp)?;
+    let x_new = xp[i] + dx * rates[i] / precision;
+    let y_new = get_y(i, j, x_new, &xp, d, amp)?;
+
+    if xp[j] <= y_new {
+        return None;
+    }
+
+    let dy = xp[j] - y_new - U256::from(1);
+    let fee_rate = dynamic_fee(
+        (xp[i] + x_new) / U256::from(2u64),
+        (xp[j] + y_new) / U256::from(2u64),
+        fee,
+        offpeg_fee_multiplier,
+    );
+    let dy_fee = fee_rate * dy / U256::from(FEE_DENOMINATOR);
+    let result = (dy - dy_fee) * precision / rates[j];
+    if result.is_zero() {
+        return None;
+    }
+
+    let dy_admin_fee = dy_fee * admin_fee / U256::from(FEE_DENOMINATOR) * precision / rates[j];
+    Some((result, dy_admin_fee))
+}
+
 pub fn get_amount_in(
     balances: &[U256],
     rates: &[U256],
@@ -74,6 +123,9 @@ pub fn get_amount_in(
     }
     let precision = U256::from(PRECISION);
     let fee_denom = U256::from(FEE_DENOMINATOR);
+    let two = U256::from(2u64);
+    let one = U256::from(1u64);
+
     let xp: Vec<U256> = balances
         .iter()
         .zip(rates.iter())
@@ -81,39 +133,72 @@ pub fn get_amount_in(
         .collect();
     let d = get_d(&xp, amp)?;
 
-    // Reverse denorm
-    let dy_after_fee_internal = desired_output * rates[j] / precision;
+    // On-chain exchange() does:
+    //   dy_raw = xp[j] - get_y(xp_with_dx) - 1
+    //   fee_amount = dynamic_fee((xp[i]+x_new)/2, (xp[j]+y_new)/2, ...) * dy_raw / FEE_DENOM
+    //   dy = (dy_raw - fee_amount) * PRECISION / rates[j]
+    //
+    // We want dx such that dy = desired_output.
+    // Strategy: compute dy_raw from desired_output by inverting the fee,
+    // then find x_new via get_y, then derive dx.
+    // Two passes to converge the dynamic fee exactly.
 
-    // First pass: use base fee as estimate (round up)
-    let fee_complement = fee_denom - fee;
-    let dy_internal =
-        (dy_after_fee_internal * fee_denom + fee_complement - U256::from(1)) / fee_complement;
-    if xp[j] <= dy_internal + U256::from(1) {
+    let dy_target_norm = desired_output * rates[j] / precision;
+
+    // Pass 1: estimate fee from pre-swap xp
+    let fee_est = dynamic_fee(xp[i], xp[j], fee, offpeg_fee_multiplier);
+    let dy_raw_est = (dy_target_norm * fee_denom + fee_denom - fee_est - one)
+        / (fee_denom - fee_est)
+        + one; // +1 for the -1 offset in dy_raw = xp[j] - y - 1
+
+    if xp[j] <= dy_raw_est {
         return None;
     }
-    let y_new = xp[j] - dy_internal - U256::from(1);
-    let x_new = get_y(j, i, y_new, &xp, d, amp)?;
+    let y_new_est = xp[j] - dy_raw_est;
+    let x_new_est = get_y(j, i, y_new_est, &xp, d, amp)?;
 
-    // Second pass: recompute with actual dynamic fee
-    let actual_fee = dynamic_fee(
-        (xp[i] + x_new) / U256::from(2u64),
-        (xp[j] + y_new) / U256::from(2u64),
+    // Pass 2: recompute with actual dynamic fee from avg xp
+    let fee_actual = dynamic_fee(
+        (xp[i] + x_new_est) / two,
+        (xp[j] + y_new_est) / two,
         fee,
         offpeg_fee_multiplier,
     );
-    let actual_complement = fee_denom - actual_fee;
-    let dy_internal =
-        (dy_after_fee_internal * fee_denom + actual_complement - U256::from(1)) / actual_complement;
-    if xp[j] <= dy_internal + U256::from(1) {
+    let dy_raw = (dy_target_norm * fee_denom + fee_denom - fee_actual - one)
+        / (fee_denom - fee_actual)
+        + one;
+
+    if xp[j] <= dy_raw {
         return None;
     }
-    let y_new = xp[j] - dy_internal - U256::from(1);
+    let y_new = xp[j] - dy_raw;
     let x_new = get_y(j, i, y_new, &xp, d, amp)?;
+
     if x_new <= xp[i] {
         return None;
     }
-    let dx = (x_new - xp[i]) * precision / rates[i] + U256::from(1);
-    Some(dx)
+
+    // dx in native units, round up to guarantee overshoot
+    let dx = (x_new - xp[i]) * precision / rates[i] + one;
+
+    // Verify: get_amount_out(dx) must produce >= desired_output.
+    // The two-pass fee estimation can undershoot when offpeg_fee_multiplier
+    // is large, because the dynamic fee depends on the mid-swap xp which
+    // shifts between passes. Binary-search the remainder if needed.
+    let mut dx = dx;
+    for iteration in 0..8 {
+        let dy_got = get_amount_out(balances, rates, amp, fee, offpeg_fee_multiplier, i, j, dx)
+            .unwrap_or(U256::ZERO);
+        // Debug: uncomment to trace convergence
+        // eprintln!("[get_amount_in] iter={iteration} dx={dx} dy_got={dy_got} desired={desired_output}");
+        if dy_got >= desired_output {
+            return Some(dx);
+        }
+        let deficit_norm = (desired_output - dy_got) * rates[i] / precision;
+        let bump = std::cmp::max(deficit_norm * precision / rates[i] + one, one);
+        dx = dx + bump;
+    }
+    None
 }
 
 /// Spot price dy/dx including fee, returned as (numerator, denominator).

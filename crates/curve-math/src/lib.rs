@@ -47,3 +47,12 @@ pub mod swap;
 mod pool;
 #[cfg(feature = "swap")]
 pub use pool::{Pool, PoolError};
+
+#[cfg(feature = "swap")]
+pub mod exchange;
+#[cfg(feature = "swap")]
+pub mod exchange_ng;
+#[cfg(feature = "swap")]
+pub mod exchange_twocrypto_ng;
+#[cfg(feature = "swap")]
+pub mod exchange_tricrypto_v1;

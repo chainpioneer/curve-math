@@ -335,6 +335,120 @@ pub fn get_y_2_ng(ann: U256, gamma: U256, x: [U256; 2], d: U256, i: usize) -> Op
     Some((y_out, k0_prev))
 }
 
+/// Compute the CryptoSwap invariant D using Newton's method (2-coin).
+///
+/// Port of `TwocryptoMath.vy::newton_D`. ANN is `A * N^N` (already scaled
+/// by `A_MULTIPLIER`). `x` are the normalized balances (precision-adjusted
+/// and price_scale-adjusted). `k0_prev` is an initial guess hint from the
+/// Cardano solver; pass `U256::ZERO` for the default initial guess.
+///
+/// Returns `None` if the iteration does not converge.
+pub fn newton_d(ann: U256, gamma: U256, x_unsorted: [U256; 2], k0_prev: U256) -> Option<U256> {
+    let n = U256::from(2u64);
+
+    // Sort descending
+    let x = if x_unsorted[0] < x_unsorted[1] {
+        [x_unsorted[1], x_unsorted[0]]
+    } else {
+        x_unsorted
+    };
+
+    // Safety checks matching Vyper assertions
+    let min_x = U256::from(10u64).pow(U256::from(9u64));
+    let max_x = U256::from(10u64).pow(U256::from(33u64));
+    if x[0] < min_x || x[0] > max_x {
+        return None;
+    }
+    // x[1] * 10^18 / x[0] > 10^14
+    if x[1] * WAD / x[0] < U256::from(10u64).pow(U256::from(14u64)) {
+        return None;
+    }
+
+    let s = x[0] + x[1];
+
+    // Initial D guess
+    let mut d = if k0_prev.is_zero() {
+        n * isqrt(x[0] * x[1])
+    } else {
+        // D = isqrt(x[0] * x[1] * 4 / K0_prev * 10^18)
+        let inner = U256::from(4u64) * x[0] * x[1] / k0_prev * WAD;
+        let d_init = isqrt(inner);
+        if s < d_init { s } else { d_init }
+    };
+
+    let g1k0_base = gamma + WAD;
+
+    for _ in 0..MAX_ITERATIONS {
+        let d_prev = d;
+        if d.is_zero() {
+            return None;
+        }
+
+        // K0 = 10^18 * N^2 * x[0] / D * x[1] / D
+        let k0 = WAD * n * n * x[0] / d * x[1] / d;
+
+        let _g1k0 = if g1k0_base > k0 {
+            g1k0_base - k0 + U256::from(1u64)
+        } else {
+            k0 - g1k0_base + U256::from(1u64)
+        };
+
+        // mul1 = 10^18 * D / gamma * _g1k0 / gamma * _g1k0 * A_MULTIPLIER / ANN
+        let mul1 = WAD * d / gamma * _g1k0 / gamma * _g1k0 * A_MULTIPLIER / ann;
+
+        // mul2 = (2 * 10^18) * N * K0 / _g1k0
+        let mul2 = U256::from(2u64) * WAD * n * k0 / _g1k0;
+
+        // neg_fprime = (S + S * mul2 / 10^18) + mul1 * N / K0 - mul2 * D / 10^18
+        if k0.is_zero() {
+            return None;
+        }
+        let neg_fprime = (s + s * mul2 / WAD) + mul1 * n / k0 - mul2 * d / WAD;
+
+        if neg_fprime.is_zero() {
+            return None;
+        }
+
+        // D_plus = D * (neg_fprime + S) / neg_fprime
+        let d_plus = d * (neg_fprime + s) / neg_fprime;
+
+        // D_minus = D * D / neg_fprime
+        let mut d_minus = d * d / neg_fprime;
+
+        if WAD > k0 {
+            // D_minus += D * (mul1 / neg_fprime) / 10^18 * (10^18 - K0) / K0
+            d_minus += d * (mul1 / neg_fprime) / WAD * (WAD - k0) / k0;
+        } else {
+            // D_minus -= D * (mul1 / neg_fprime) / 10^18 * (K0 - 10^18) / K0
+            d_minus -= d * (mul1 / neg_fprime) / WAD * (k0 - WAD) / k0;
+        }
+
+        d = if d_plus > d_minus {
+            d_plus - d_minus
+        } else {
+            (d_minus - d_plus) / U256::from(2u64)
+        };
+
+        let diff = if d > d_prev { d - d_prev } else { d_prev - d };
+
+        // Convergence: diff * 10^14 < max(10^16, D)
+        let threshold = U256::from(10u64).pow(U256::from(16u64)).max(d);
+        if diff * U256::from(10u64).pow(U256::from(14u64)) < threshold {
+            // Validate output
+            for &xi in &x {
+                let frac = xi * WAD / d;
+                let min_frac = U256::from(10u64).pow(U256::from(16u64)) / n;
+                let max_frac = U256::from(10u64).pow(U256::from(20u64)) / n;
+                if frac < min_frac || frac > max_frac {
+                    return None;
+                }
+            }
+            return Some(d);
+        }
+    }
+    None // Did not converge
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -395,6 +509,80 @@ mod tests {
         let result = cbrt(x);
         // result should be approximately 2e18 (depending on scaling)
         assert!(result > U256::ZERO);
+    }
+
+    #[test]
+    fn newton_d_balanced() {
+        let wad = WAD;
+        let ann = U256::from(540_000u64) * A_MULTIPLIER;
+        let gamma = U256::from(11_809_167_828_997u64);
+        let x0 = U256::from(5000u64) * wad;
+        let x1 = U256::from(5000u64) * wad;
+        let d = newton_d(ann, gamma, [x0, x1], U256::ZERO).expect("should converge");
+        // For balanced pool, D should be approximately sum of x (slightly more due to AMM invariant)
+        assert!(d > U256::ZERO);
+        assert!(d <= x0 + x1 + wad); // D <= S + epsilon
+        assert!(d >= x0 + x1 - wad); // D >= S - epsilon (balanced pool, D ≈ S)
+    }
+
+    #[test]
+    fn newton_d_imbalanced() {
+        let wad = WAD;
+        let ann = U256::from(540_000u64) * A_MULTIPLIER;
+        let gamma = U256::from(11_809_167_828_997u64);
+        let x0 = U256::from(8000u64) * wad;
+        let x1 = U256::from(3000u64) * wad;
+        let d = newton_d(ann, gamma, [x0, x1], U256::ZERO).expect("should converge");
+        assert!(d > U256::ZERO);
+        // D should be between geometric mean * 2 and sum
+        let s = x0 + x1;
+        assert!(d <= s);
+    }
+
+    #[test]
+    fn newton_d_idempotent() {
+        // Computing D twice from the same inputs must give the exact same result.
+        let wad = WAD;
+        let ann = U256::from(540_000u64) * A_MULTIPLIER;
+        let gamma = U256::from(11_809_167_828_997u64);
+        let x0 = U256::from(5000u64) * wad;
+        let x1 = U256::from(5000u64) * wad;
+        let d1 = newton_d(ann, gamma, [x0, x1], U256::ZERO).expect("converge");
+        let d2 = newton_d(ann, gamma, [x0, x1], U256::ZERO).expect("converge");
+        assert_eq!(d1, d2);
+    }
+
+    #[test]
+    fn newton_d_monotonic_with_balance() {
+        // Adding more balance should increase D
+        let wad = WAD;
+        let ann = U256::from(540_000u64) * A_MULTIPLIER;
+        let gamma = U256::from(11_809_167_828_997u64);
+        let d1 = newton_d(ann, gamma, [U256::from(5000u64) * wad, U256::from(5000u64) * wad], U256::ZERO).unwrap();
+        let d2 = newton_d(ann, gamma, [U256::from(6000u64) * wad, U256::from(5000u64) * wad], U256::ZERO).unwrap();
+        assert!(d2 > d1, "D should increase when balance increases");
+    }
+
+    #[test]
+    fn newton_d_matches_onchain_base_pool() {
+        // Differential test against on-chain MATH.newton_D(ann, gamma, xp, 0)
+        // for a real TwoCryptoNG pool on Base.
+        // Pool: 0xba0C274085A078D19C46F2D902698A841cBFb289
+        // MATH: 0x1Fd8Af16DC4BEBd950521308D55d0543b6cDF4A1
+        // State at block 44390853:
+        //   A() = 400000, gamma() = 145000000000000
+        //   balances = [13468613186144972495445, 78708197296380537431887]
+        //   price_scale = 165034242067512353, precisions = [1, 1]
+        //   xp = [13468613186144972495445, 12989547685308386938490]
+        //   On-chain MATH.newton_D(400000, 145000000000000, xp, 0) = 26457022398539583448691
+        let ann = U256::from(400_000u64);
+        let gamma = U256::from(145_000_000_000_000u64);
+        let xp0 = U256::from_str_radix("13468613186144972495445", 10).unwrap();
+        let xp1 = U256::from_str_radix("12989547685308386938490", 10).unwrap();
+        let expected_d = U256::from_str_radix("26457022398539583448691", 10).unwrap();
+
+        let d = newton_d(ann, gamma, [xp0, xp1], U256::ZERO).expect("should converge");
+        assert_eq!(d, expected_d, "must match on-chain MATH.newton_D exactly");
     }
 
     #[test]

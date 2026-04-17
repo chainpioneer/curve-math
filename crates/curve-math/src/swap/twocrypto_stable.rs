@@ -29,7 +29,8 @@ fn crypto_fee(xp: &[U256], mid_fee: U256, out_fee: U256, fee_gamma: U256) -> Opt
     for x_i in xp {
         k = k * (*x_i) / s;
     }
-    // NG fee formula: f = fee_gamma * k / (fee_gamma * k / WAD + WAD - k)
+    // TwoCryptoStable uses the NG fee formula:
+    // f = fee_gamma * K / (fee_gamma * K / WAD + WAD - K)
     let f = if fee_gamma > U256::ZERO {
         fee_gamma * k / (fee_gamma * k / wad + wad - k)
     } else {
@@ -276,5 +277,35 @@ mod tests {
         )
         .expect("swap");
         assert!(dy > U256::ZERO);
+    }
+}
+
+#[cfg(test)]
+mod tests_regression {
+    use super::*;
+    use alloy_primitives::U256;
+
+    #[test]
+    fn usdc_brz_swap_exact() {
+        let balances = [
+            U256::from_str_radix("15648509843", 10).unwrap(),
+            U256::from_str_radix("23077548778014699159559", 10).unwrap(),
+        ];
+        let precisions = [
+            U256::from_str_radix("1000000000000", 10).unwrap(),
+            U256::from(1u64),
+        ];
+        let price_scale = U256::from_str_radix("176536076983211030", 10).unwrap();
+        let d = U256::from_str_radix("19528975591374112747855", 10).unwrap();
+        let ann = U256::from(250000u64);
+        let mid_fee = U256::from(2000000u64);
+        let out_fee = U256::from(5000000u64);
+        let fee_gamma = U256::from_str_radix("1000000000000000", 10).unwrap();
+        let dx = U256::from(5000000000u64);
+
+        let dy = get_amount_out(&balances, &precisions, price_scale, d, ann, mid_fee, out_fee, fee_gamma, 0, 1, dx);
+        eprintln!("dy = {:?}", dy);
+        // On-chain get_dy = 18618150526389060952858
+        assert_eq!(dy.unwrap(), U256::from_str_radix("18618150526389060952858", 10).unwrap());
     }
 }

@@ -100,7 +100,12 @@ pub fn get_amount_in(
         return None;
     }
     let dx = (x_new - xp[i]) / precision_mul[i] + U256::from(1);
-    Some(dx)
+    // Verify overshoot
+    let check = get_amount_out(balances, precision_mul, amp, fee, offpeg_fee_multiplier, i, j, dx);
+    match check {
+        Some(dy) if dy >= desired_output => Some(dx),
+        _ => Some(dx + U256::from(1)),
+    }
 }
 
 /// Spot price dy/dx including fee, returned as (numerator, denominator).
