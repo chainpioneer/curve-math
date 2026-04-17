@@ -193,7 +193,6 @@ impl TwoCryptoNGState {
         };
         self.tweak_price(a_gamma, xp, d_new, k0_prev, block_timestamp);
 
-        eprintln!("  TwoCryptoNG exchange: dy={dy}, D={}, ps={}", self.d, self.price_scale);
 
         Some(ExchangeResult { dy, fee: fee_amount })
     }
@@ -233,7 +232,6 @@ impl TwoCryptoNGState {
             self.last_prices_timestamp = block_timestamp;
         }
 
-        eprintln!("  tweak_price_2ng: _xp=[{},{}], k0_prev={k0_prev}, is_stable={}", _xp[0], _xp[1], self.is_stable);
         // D
         let d_unadjusted = if new_d.is_zero() {
             if self.is_stable {

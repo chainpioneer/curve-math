@@ -257,14 +257,10 @@ impl TriCryptoNGState {
             let dt = U256::from(block_timestamp - last_prices_timestamp);
             let power = -I256::try_from(dt * WAD / ma_time).unwrap();
             let alpha = wad_exp(power);
-            eprintln!("[DBG ema] dt={} ma_time={} power={} alpha={}",
-                dt, ma_time, power, alpha);
 
             for k in 0..2 {
                 let capped_price = last_prices[k].min(U256::from(2u64) * price_scale[k]);
                 let new_po = (capped_price * (WAD - alpha) + price_oracle[k] * alpha) / WAD;
-                eprintln!("[DBG ema] k={} capped={} old_po={} new_po={}",
-                    k, capped_price, price_oracle[k], new_po);
                 price_oracle[k] = new_po;
             }
             self.price_oracle = price_oracle;
@@ -333,13 +329,8 @@ impl TriCryptoNGState {
                 for k in 0..2 {
                     xp_adj[k + 1] = _xp[k + 1] * p_new[k] / price_scale[k];
                 }
-                eprintln!("[DBG tweak_rb] po=[{},{}] ps=[{},{}] norm={} adj_step={}",
-                    price_oracle[0], price_oracle[1], price_scale[0], price_scale[1], norm, adjustment_step);
-                eprintln!("[DBG tweak_rb] p_new=[{},{}] xp_adj=[{},{},{}]",
-                    p_new[0], p_new[1], xp_adj[0], xp_adj[1], xp_adj[2]);
 
                 if let Some(d) = tricrypto_ng::newton_d(a_gamma[0], a_gamma[1], xp_adj, U256::ZERO) {
-                    eprintln!("[DBG tweak_rb] newton_d -> {}", d);
                     let mut xp2 = [U256::ZERO; 3];
                     xp2[0] = d / n;
                     for k in 0..2 {
@@ -386,9 +377,6 @@ impl TriCryptoNGState {
         coin_amount: U256,
         block_timestamp: u64,
     ) -> Option<U256> {
-        eprintln!("[DBG arlo] enter: burn={} i={} coin_amount={} ts={}", burn_amount, coin_index, coin_amount, block_timestamp);
-        eprintln!("[DBG arlo] state: d={} ts={} bal={:?} ps={:?} po={:?} lp={:?} vp={} xcp_profit={} xcp_profit_a={}",
-            self.d, self.total_supply, self.balances, self.price_scale, self.price_oracle, self.last_prices, self.virtual_price, self.xcp_profit, self.xcp_profit_a);
         if coin_index >= 3 {
             return None;
         }
@@ -470,8 +458,6 @@ impl TriCryptoNGState {
         // xp[i] = y  (intermediate xp passed to tweak_price)
         xp[i] = y;
 
-        eprintln!("[DBG arlo] linear d_after_calc={} (d_old={}, dD={}, D_fee={}, fee={})", d, d0, dd, d_fee, fee);
-        eprintln!("[DBG arlo] xp_intermediate (xp[i]=y)={:?}", xp);
 
         // self.balances[i] -= dy   (line 768 in v0.3.9)
         self.balances[i] = self.balances[i] - coin_amount;
@@ -481,7 +467,6 @@ impl TriCryptoNGState {
         // tweak_price(A_gamma, xp, D, 0) -- note: D here is the LINEAR D, not 0
         self.tweak_price(a_gamma, xp, d, U256::ZERO, block_timestamp);
 
-        eprintln!("[DBG arlo] post tweak_price: self.d={}", self.d);
         Some(self.d)
     }
 }
@@ -501,7 +486,6 @@ mod tests {
         let result = wad_exp(I256::try_from(WAD).unwrap());
         // e^1 ≈ 2.71828... * 1e18
         let expected = U256::from(2_718_281_828_459_045_235u128);
-        eprintln!("wad_exp(1e18) = {result}, expected = {expected}");
         let diff = if result > expected { result - expected } else { expected - result };
         assert!(diff < U256::from(1_000_000_000u64), "e^1 precision: diff={diff}");
     }
