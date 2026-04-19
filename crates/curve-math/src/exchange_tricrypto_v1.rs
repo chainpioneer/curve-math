@@ -361,6 +361,7 @@ impl TriCryptoV1State {
                 self.not_adjusted = false;
                 self.d = d_unadjusted;
                 self.virtual_price = virtual_price;
+                self.claim_admin_fees();
                 return;
             }
         }
@@ -370,6 +371,53 @@ impl TriCryptoV1State {
 
         if needs_adjustment {
             self.not_adjusted = false;
+            self.claim_admin_fees();
+        }
+    }
+
+    /// Port of Vyper `_claim_admin_fees()` for 3-coin V1 pools.
+    /// Same logic as `TwoCryptoV1State::claim_admin_fees` but with 3 coins.
+    /// Source: tricrypto_v1.vy (same pattern as twocrypto_v1.vy L475-511).
+    pub fn claim_admin_fees(&mut self) {
+        let xcp_profit = self.xcp_profit;
+        let xcp_profit_a = self.xcp_profit_a;
+        let vprice = self.virtual_price;
+        let exp_precision = U256::from(10_000_000_000u64); // 10^10
+
+        if xcp_profit > xcp_profit_a {
+            let two_fee_denom = U256::from(2u64) * exp_precision;
+            let fees = (xcp_profit - xcp_profit_a) * self.admin_fee / two_fee_denom;
+            if !fees.is_zero() && vprice > fees {
+                let frac = vprice * WAD / (vprice - fees) - WAD;
+                let claimed = self.total_supply * frac / WAD;
+                self.xcp_profit = xcp_profit - fees * U256::from(2u64);
+                self.total_supply = self.total_supply + claimed;
+            }
+        }
+
+        // Recalculate D from current balances + price_scale
+        let n = U256::from(N_COINS);
+        let xp = [
+            self.balances[0] * self.precisions[0],
+            self.balances[1] * self.price_scale[0] * self.precisions[1] / PRECISION,
+            self.balances[2] * self.price_scale[1] * self.precisions[2] / PRECISION,
+        ];
+        if let Some(new_d) = newton_d_3_v1(self.ann, self.gamma, xp) {
+            self.d = new_d;
+            // get_xcp(D) for 3 coins: geometric_mean([D/N, D*1e18/(N*ps[0]), D*1e18/(N*ps[1])])
+            let x = [
+                new_d / n,
+                new_d * PRECISION / (n * self.price_scale[0]),
+                new_d * PRECISION / (n * self.price_scale[1]),
+            ];
+            let xcp = geometric_mean_3(x);
+            if !self.total_supply.is_zero() {
+                self.virtual_price = WAD * xcp / self.total_supply;
+            }
+        }
+
+        if self.xcp_profit > xcp_profit_a {
+            self.xcp_profit_a = self.xcp_profit;
         }
     }
 }

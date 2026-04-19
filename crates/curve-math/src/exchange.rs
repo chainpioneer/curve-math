@@ -443,7 +443,7 @@ impl TwoCryptoV1State {
                 self.not_adjusted = false;
                 self.d = d_unadjusted;
                 self.virtual_price = virtual_price;
-                // _claim_admin_fees omitted (doesn't affect swap math)
+                self.claim_admin_fees();
                 return;
             }
         }
@@ -453,7 +453,61 @@ impl TwoCryptoV1State {
 
         if needs_adjustment {
             self.not_adjusted = false;
-            // _claim_admin_fees omitted
+            self.claim_admin_fees();
+        }
+    }
+
+    /// Port of Vyper `_claim_admin_fees()` (twocrypto_v1.vy L475-511).
+    ///
+    /// Called from `tweak_price` in non-adjustment paths. On-chain this:
+    ///   1. Gulps balances (no-op for non-rebasing tokens — skipped here)
+    ///   2. If xcp_profit > xcp_profit_a and fees > 0 and receiver != 0:
+    ///      mints admin LP tokens, decrements xcp_profit
+    ///   3. Recalculates D via newton_D(xp)
+    ///   4. Updates virtual_price = 1e18 * get_xcp(D) / total_supply
+    ///   5. If xcp_profit > xcp_profit_a: sets xcp_profit_a = xcp_profit
+    pub fn claim_admin_fees(&mut self) {
+        let xcp_profit = self.xcp_profit;
+        let xcp_profit_a = self.xcp_profit_a;
+        // Skip gulp — our balances are event-tracked
+        let vprice = self.virtual_price;
+
+        if xcp_profit > xcp_profit_a {
+            let two_fee_denom = U256::from(2u64) * EXP_PRECISION; // 2 * 10^10
+            let fees = (xcp_profit - xcp_profit_a) * self.admin_fee / two_fee_denom;
+            if !fees.is_zero() && vprice > fees {
+                // frac = vprice * 1e18 / (vprice - fees) - 1e18
+                let frac = vprice * WAD / (vprice - fees) - WAD;
+                // claimed = total_supply * frac / 1e18 (mint_relative)
+                let claimed = self.total_supply * frac / WAD;
+                self.xcp_profit = xcp_profit - fees * U256::from(2u64);
+                self.total_supply = self.total_supply + claimed;
+            }
+        }
+
+        // Recalculate D from current balances + price_scale
+        let xp = [
+            self.balances[0] * self.precisions[0],
+            self.balances[1] * self.price_scale * self.precisions[1] / PRECISION,
+        ];
+        if let Some(new_d) = twocrypto_v1::newton_d(self.ann, self.gamma, xp) {
+            self.d = new_d;
+            // virtual_price = 1e18 * get_xcp(D) / total_supply
+            // get_xcp(D) = geometric_mean([D/2, D*1e18/(2*price_scale)])
+            let x = [
+                new_d / N_COINS,
+                new_d * PRECISION / (N_COINS * self.price_scale),
+            ];
+            let xcp = geometric_mean(x, true);
+            if !self.total_supply.is_zero() {
+                self.virtual_price = WAD * xcp / self.total_supply;
+            }
+        }
+
+        // "if xcp_profit > xcp_profit_a: self.xcp_profit_a = xcp_profit"
+        // Uses original xcp_profit_a (local var) and possibly-decremented xcp_profit
+        if self.xcp_profit > xcp_profit_a {
+            self.xcp_profit_a = self.xcp_profit;
         }
     }
 }
