@@ -110,7 +110,7 @@ pub fn crypto_fee(xp: &[U256], mid_fee: U256, out_fee: U256, fee_gamma: U256) ->
 
 /// Geometric mean of 2 values via Newton iteration, matching V1 on-chain.
 /// Port of Vyper `geometric_mean(x, sort)`.
-fn geometric_mean(unsorted_x: [U256; 2], sort: bool) -> U256 {
+fn geometric_mean(unsorted_x: [U256; 2], sort: bool) -> Option<U256> {
     let x = if sort && unsorted_x[0] < unsorted_x[1] {
         [unsorted_x[1], unsorted_x[0]]
     } else {
@@ -120,13 +120,15 @@ fn geometric_mean(unsorted_x: [U256; 2], sort: bool) -> U256 {
     let n = U256::from(2u64);
     for _ in 0..255u32 {
         let d_prev = d;
-        d = (d + x[0] * x[1] / d) / n;
+        d = d
+            .checked_add(x[0].checked_mul(x[1])?.checked_div(d)?)?
+            .checked_div(n)?;
         let diff = if d > d_prev { d - d_prev } else { d_prev - d };
-        if diff <= U256::from(1u64) || diff * WAD < d {
-            return d;
+        if diff <= U256::from(1u64) || diff.checked_mul(WAD)? < d {
+            return Some(d);
         }
     }
-    d
+    Some(d)
 }
 
 /// Compute the CryptoSwap invariant D using Newton's method (2-coin, V1).
@@ -147,20 +149,26 @@ pub fn newton_d(ann: U256, gamma: U256, x_unsorted: [U256; 2]) -> Option<U256> {
     if x[0] < min_x || x[0] > max_x {
         return None;
     }
-    if x[1] * WAD / x[0] < U256::from(10u64).pow(U256::from(14u64)) {
+    if x[1].checked_mul(WAD)?.checked_div(x[0])? < U256::from(10u64).pow(U256::from(14u64)) {
         return None;
     }
 
     // V1 uses geometric_mean for initial guess (NOT isqrt)
-    let mut d = n * geometric_mean(x, false);
-    let s = x[0] + x[1];
+    let mut d = n.checked_mul(geometric_mean(x, false)?)?;
+    let s = x[0].checked_add(x[1])?;
 
-    let g1k0_base = gamma + WAD;
+    let g1k0_base = gamma.checked_add(WAD)?;
 
     for _ in 0..255u32 {
         let d_prev = d;
 
-        let k0 = WAD * n * n * x[0] / d * x[1] / d;
+        let k0 = WAD
+            .checked_mul(n)?
+            .checked_mul(n)?
+            .checked_mul(x[0])?
+            .checked_div(d)?
+            .checked_mul(x[1])?
+            .checked_div(d)?;
 
         let _g1k0 = if g1k0_base > k0 {
             g1k0_base - k0 + U256::from(1u64)
@@ -168,25 +176,51 @@ pub fn newton_d(ann: U256, gamma: U256, x_unsorted: [U256; 2]) -> Option<U256> {
             k0 - g1k0_base + U256::from(1u64)
         };
 
-        let mul1 = WAD * d / gamma * _g1k0 / gamma * _g1k0 * A_MULTIPLIER / ann;
-        let mul2 = U256::from(2u64) * WAD * n * k0 / _g1k0;
+        let mul1 = WAD
+            .checked_mul(d)?
+            .checked_div(gamma)?
+            .checked_mul(_g1k0)?
+            .checked_div(gamma)?
+            .checked_mul(_g1k0)?
+            .checked_mul(A_MULTIPLIER)?
+            .checked_div(ann)?;
+        let mul2 = U256::from(2u64)
+            .checked_mul(WAD)?
+            .checked_mul(n)?
+            .checked_mul(k0)?
+            .checked_div(_g1k0)?;
 
         if k0.is_zero() {
             return None;
         }
-        let neg_fprime = (s + s * mul2 / WAD) + mul1 * n / k0 - mul2 * d / WAD;
+        let neg_fprime = s
+            .checked_add(s.checked_mul(mul2)?.checked_div(WAD)?)?
+            .checked_add(mul1.checked_mul(n)?.checked_div(k0)?)?
+            .checked_sub(mul2.checked_mul(d)?.checked_div(WAD)?)?;
 
         if neg_fprime.is_zero() {
             return None;
         }
 
-        let d_plus = d * (neg_fprime + s) / neg_fprime;
-        let mut d_minus = d * d / neg_fprime;
+        let d_plus = d
+            .checked_mul(neg_fprime.checked_add(s)?)?
+            .checked_div(neg_fprime)?;
+        let mut d_minus = d.checked_mul(d)?.checked_div(neg_fprime)?;
 
         if WAD > k0 {
-            d_minus += d * (mul1 / neg_fprime) / WAD * (WAD - k0) / k0;
+            d_minus = d_minus.checked_add(
+                d.checked_mul(mul1.checked_div(neg_fprime)?)?
+                    .checked_div(WAD)?
+                    .checked_mul(WAD - k0)?
+                    .checked_div(k0)?,
+            )?;
         } else {
-            d_minus -= d * (mul1 / neg_fprime) / WAD * (k0 - WAD) / k0;
+            d_minus = d_minus.checked_sub(
+                d.checked_mul(mul1.checked_div(neg_fprime)?)?
+                    .checked_div(WAD)?
+                    .checked_mul(k0 - WAD)?
+                    .checked_div(k0)?,
+            )?;
         }
 
         d = if d_plus > d_minus {
@@ -198,9 +232,9 @@ pub fn newton_d(ann: U256, gamma: U256, x_unsorted: [U256; 2]) -> Option<U256> {
         let diff = if d > d_prev { d - d_prev } else { d_prev - d };
 
         let threshold = U256::from(10u64).pow(U256::from(16u64)).max(d);
-        if diff * U256::from(10u64).pow(U256::from(14u64)) < threshold {
+        if diff.checked_mul(U256::from(10u64).pow(U256::from(14u64)))? < threshold {
             for &xi in &x {
-                let frac = xi * WAD / d;
+                let frac = xi.checked_mul(WAD)?.checked_div(d)?;
                 if frac < U256::from(10u64).pow(U256::from(16u64)) - U256::from(1u64)
                     || frac > U256::from(10u64).pow(U256::from(20u64)) + U256::from(1u64)
                 {

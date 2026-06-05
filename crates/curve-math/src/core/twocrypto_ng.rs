@@ -131,8 +131,8 @@ pub fn newton_y_2_ng(
 ) -> Option<U256> {
     let n = U256::from(2u64);
     let x_j = x[1 - i];
-    let mut y = d * d / (x_j * U256::from(4u64));
-    let k0_i = WAD * n * x_j / d;
+    let mut y = d.checked_mul(d)?.checked_div(x_j.checked_mul(U256::from(4u64))?)?;
+    let k0_i = WAD.checked_mul(n)?.checked_mul(x_j)?.checked_div(d)?;
     if k0_i < U256::from(10u128.pow(36)) / lim_mul || k0_i > lim_mul {
         return None;
     }
@@ -141,29 +141,47 @@ pub fn newton_y_2_ng(
         .max(U256::from(100u64));
     for _ in 0..MAX_ITERATIONS {
         let y_prev = y;
-        let k0 = k0_i * y * n / d;
-        let s = x_j + y;
+        let k0 = k0_i.checked_mul(y)?.checked_mul(n)?.checked_div(d)?;
+        let s = x_j.checked_add(y)?;
         let _g1k0 = {
-            let g = gamma + WAD;
+            let g = gamma.checked_add(WAD)?;
             if g > k0 {
                 g - k0 + U256::from(1)
             } else {
                 k0 - g + U256::from(1)
             }
         };
-        let mul1 = WAD * d / gamma * _g1k0 / gamma * _g1k0 * A_MULTIPLIER / ann;
-        let mul2 = WAD + U256::from(2u64) * WAD * k0 / _g1k0;
-        let yfprime = WAD * y + s * mul2 + mul1;
-        let _dyfprime = d * mul2;
+        let mul1 = WAD
+            .checked_mul(d)?
+            .checked_div(gamma)?
+            .checked_mul(_g1k0)?
+            .checked_div(gamma)?
+            .checked_mul(_g1k0)?
+            .checked_mul(A_MULTIPLIER)?
+            .checked_div(ann)?;
+        let mul2 = WAD.checked_add(
+            U256::from(2u64)
+                .checked_mul(WAD)?
+                .checked_mul(k0)?
+                .checked_div(_g1k0)?,
+        )?;
+        let yfprime = WAD
+            .checked_mul(y)?
+            .checked_add(s.checked_mul(mul2)?)?
+            .checked_add(mul1)?;
+        let _dyfprime = d.checked_mul(mul2)?;
         if yfprime < _dyfprime {
             y = y_prev / U256::from(2);
             continue;
         }
         let yfprime = yfprime - _dyfprime;
-        let fprime = yfprime / y;
-        let y_minus = mul1 / fprime;
-        let y_plus = (yfprime + WAD * d) / fprime + y_minus * WAD / k0;
-        let y_minus = y_minus + WAD * s / fprime;
+        let fprime = yfprime.checked_div(y)?;
+        let y_minus = mul1.checked_div(fprime)?;
+        let y_plus = yfprime
+            .checked_add(WAD.checked_mul(d)?)?
+            .checked_div(fprime)?
+            .checked_add(y_minus.checked_mul(WAD)?.checked_div(k0)?)?;
+        let y_minus = y_minus.checked_add(WAD.checked_mul(s)?.checked_div(fprime)?)?;
         if y_plus < y_minus {
             y = y_prev / U256::from(2);
         } else {
@@ -194,6 +212,11 @@ pub fn get_y_2_ng(ann: U256, gamma: U256, x: [U256; 2], d: U256, i: usize) -> Op
     let gamma_s = I256::try_from(gamma).ok()?;
     let d_s = I256::try_from(d).ok()?;
     let x_j_s = I256::try_from(x[1 - i]).ok()?;
+    // fdiv / wrapping_div panic on a zero divisor; d_s and x_j_s are used as
+    // divisors below (extreme/degenerate balances can make x_j zero).
+    if d_s.is_zero() || x_j_s.is_zero() {
+        return None;
+    }
     let gamma2 = gamma_s.wrapping_mul(gamma_s);
     let e18 = I256::try_from(WAD).expect("WAD fits I256");
     let n_s = s(2);
@@ -270,6 +293,10 @@ pub fn get_y_2_ng(ann: U256, gamma: U256, x: [U256; 2], d: U256, i: usize) -> Op
     let b = b.wrapping_div(divider);
     let c = c.wrapping_div(divider);
     let d_coeff = d_coeff.wrapping_div(divider);
+    // `b` is a divisor in delta0/delta1 below; wrapping_div panics on zero.
+    if b.is_zero() {
+        return None;
+    }
     let delta0 = s(3).wrapping_mul(a).wrapping_mul(c).wrapping_div(b) - b;
     let delta1 = s(3).wrapping_mul(delta0) + b
         - s(27)
@@ -360,23 +387,27 @@ pub fn newton_d(ann: U256, gamma: U256, x_unsorted: [U256; 2], k0_prev: U256) ->
         return None;
     }
     // x[1] * 10^18 / x[0] > 10^14
-    if x[1] * WAD / x[0] < U256::from(10u64).pow(U256::from(14u64)) {
+    if x[1].checked_mul(WAD)?.checked_div(x[0])? < U256::from(10u64).pow(U256::from(14u64)) {
         return None;
     }
 
-    let s = x[0] + x[1];
+    let s = x[0].checked_add(x[1])?;
 
     // Initial D guess
     let mut d = if k0_prev.is_zero() {
-        n * isqrt(x[0] * x[1])
+        n.checked_mul(isqrt(x[0].checked_mul(x[1])?))?
     } else {
         // D = isqrt(x[0] * x[1] * 4 / K0_prev * 10^18)
-        let inner = U256::from(4u64) * x[0] * x[1] / k0_prev * WAD;
+        let inner = U256::from(4u64)
+            .checked_mul(x[0])?
+            .checked_mul(x[1])?
+            .checked_div(k0_prev)?
+            .checked_mul(WAD)?;
         let d_init = isqrt(inner);
         if s < d_init { s } else { d_init }
     };
 
-    let g1k0_base = gamma + WAD;
+    let g1k0_base = gamma.checked_add(WAD)?;
 
     for _ in 0..MAX_ITERATIONS {
         let d_prev = d;
@@ -385,7 +416,13 @@ pub fn newton_d(ann: U256, gamma: U256, x_unsorted: [U256; 2], k0_prev: U256) ->
         }
 
         // K0 = 10^18 * N^2 * x[0] / D * x[1] / D
-        let k0 = WAD * n * n * x[0] / d * x[1] / d;
+        let k0 = WAD
+            .checked_mul(n)?
+            .checked_mul(n)?
+            .checked_mul(x[0])?
+            .checked_div(d)?
+            .checked_mul(x[1])?
+            .checked_div(d)?;
 
         let _g1k0 = if g1k0_base > k0 {
             g1k0_base - k0 + U256::from(1u64)
@@ -394,33 +431,59 @@ pub fn newton_d(ann: U256, gamma: U256, x_unsorted: [U256; 2], k0_prev: U256) ->
         };
 
         // mul1 = 10^18 * D / gamma * _g1k0 / gamma * _g1k0 * A_MULTIPLIER / ANN
-        let mul1 = WAD * d / gamma * _g1k0 / gamma * _g1k0 * A_MULTIPLIER / ann;
+        let mul1 = WAD
+            .checked_mul(d)?
+            .checked_div(gamma)?
+            .checked_mul(_g1k0)?
+            .checked_div(gamma)?
+            .checked_mul(_g1k0)?
+            .checked_mul(A_MULTIPLIER)?
+            .checked_div(ann)?;
 
         // mul2 = (2 * 10^18) * N * K0 / _g1k0
-        let mul2 = U256::from(2u64) * WAD * n * k0 / _g1k0;
+        let mul2 = U256::from(2u64)
+            .checked_mul(WAD)?
+            .checked_mul(n)?
+            .checked_mul(k0)?
+            .checked_div(_g1k0)?;
 
         // neg_fprime = (S + S * mul2 / 10^18) + mul1 * N / K0 - mul2 * D / 10^18
         if k0.is_zero() {
             return None;
         }
-        let neg_fprime = (s + s * mul2 / WAD) + mul1 * n / k0 - mul2 * d / WAD;
+        let neg_fprime = s
+            .checked_add(s.checked_mul(mul2)?.checked_div(WAD)?)?
+            .checked_add(mul1.checked_mul(n)?.checked_div(k0)?)?
+            .checked_sub(mul2.checked_mul(d)?.checked_div(WAD)?)?;
 
         if neg_fprime.is_zero() {
             return None;
         }
 
         // D_plus = D * (neg_fprime + S) / neg_fprime
-        let d_plus = d * (neg_fprime + s) / neg_fprime;
+        let d_plus = d
+            .checked_mul(neg_fprime.checked_add(s)?)?
+            .checked_div(neg_fprime)?;
 
         // D_minus = D * D / neg_fprime
-        let mut d_minus = d * d / neg_fprime;
+        let mut d_minus = d.checked_mul(d)?.checked_div(neg_fprime)?;
 
         if WAD > k0 {
             // D_minus += D * (mul1 / neg_fprime) / 10^18 * (10^18 - K0) / K0
-            d_minus += d * (mul1 / neg_fprime) / WAD * (WAD - k0) / k0;
+            d_minus = d_minus.checked_add(
+                d.checked_mul(mul1.checked_div(neg_fprime)?)?
+                    .checked_div(WAD)?
+                    .checked_mul(WAD - k0)?
+                    .checked_div(k0)?,
+            )?;
         } else {
             // D_minus -= D * (mul1 / neg_fprime) / 10^18 * (K0 - 10^18) / K0
-            d_minus -= d * (mul1 / neg_fprime) / WAD * (k0 - WAD) / k0;
+            d_minus = d_minus.checked_sub(
+                d.checked_mul(mul1.checked_div(neg_fprime)?)?
+                    .checked_div(WAD)?
+                    .checked_mul(k0 - WAD)?
+                    .checked_div(k0)?,
+            )?;
         }
 
         d = if d_plus > d_minus {
@@ -433,10 +496,10 @@ pub fn newton_d(ann: U256, gamma: U256, x_unsorted: [U256; 2], k0_prev: U256) ->
 
         // Convergence: diff * 10^14 < max(10^16, D)
         let threshold = U256::from(10u64).pow(U256::from(16u64)).max(d);
-        if diff * U256::from(10u64).pow(U256::from(14u64)) < threshold {
+        if diff.checked_mul(U256::from(10u64).pow(U256::from(14u64)))? < threshold {
             // Validate output
             for &xi in &x {
-                let frac = xi * WAD / d;
+                let frac = xi.checked_mul(WAD)?.checked_div(d)?;
                 let min_frac = U256::from(10u64).pow(U256::from(16u64)) / n;
                 let max_frac = U256::from(10u64).pow(U256::from(20u64)) / n;
                 if frac < min_frac || frac > max_frac {
