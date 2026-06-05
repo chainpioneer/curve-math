@@ -184,14 +184,44 @@ pub fn get_y_3_ng(ann: U256, gamma: U256, x: [U256; 3], d: U256, i: usize) -> Op
     let gamma2 = gamma_s.wrapping_mul(gamma_s);
     let e18 = I256::try_from(WAD).expect("WAD fits I256");
     let a_mul_s = I256::try_from(A_MULTIPLIER).expect("A_MULTIPLIER fits I256");
-    let a: I256 = si(36) / s(27);
-    let b: I256 = si(36) / s(9) + s(2).wrapping_mul(e18).wrapping_mul(gamma_s) / s(27)
-        - d_s.wrapping_mul(d_s) / x_j * gamma2 * ann_s / s(27 * 27) / a_mul_s / x_k;
-    let c: I256 = si(36) / s(9)
-        + gamma_s.wrapping_mul(gamma_s + s(4).wrapping_mul(e18)) / s(27)
-        + gamma2 * (x_j + x_k - d_s) / d_s * ann_s / s(27) / a_mul_s;
-    let d_coeff: I256 = (e18 + gamma_s).wrapping_mul(e18 + gamma_s) / s(27);
-    let d0: I256 = (s(3).wrapping_mul(a).wrapping_mul(c) / b - b).abs();
+    let a: I256 = si(36).checked_div(s(27))?;
+    let b: I256 = si(36)
+        .checked_div(s(9))?
+        .checked_add(s(2).wrapping_mul(e18).wrapping_mul(gamma_s).checked_div(s(27))?)?
+        .checked_sub(
+            d_s.wrapping_mul(d_s)
+                .checked_div(x_j)?
+                .checked_mul(gamma2)?
+                .checked_mul(ann_s)?
+                .checked_div(s(27 * 27))?
+                .checked_div(a_mul_s)?
+                .checked_div(x_k)?,
+        )?;
+    let c: I256 = si(36)
+        .checked_div(s(9))?
+        .checked_add(
+            gamma_s
+                .wrapping_mul(gamma_s.checked_add(s(4).wrapping_mul(e18))?)
+                .checked_div(s(27))?,
+        )?
+        .checked_add(
+            gamma2
+                .checked_mul(x_j.checked_add(x_k)?.checked_sub(d_s)?)?
+                .checked_div(d_s)?
+                .checked_mul(ann_s)?
+                .checked_div(s(27))?
+                .checked_div(a_mul_s)?,
+        )?;
+    let d_coeff: I256 = e18
+        .checked_add(gamma_s)?
+        .wrapping_mul(e18.checked_add(gamma_s)?)
+        .checked_div(s(27))?;
+    let d0: I256 = s(3)
+        .wrapping_mul(a)
+        .wrapping_mul(c)
+        .checked_div(b)?
+        .checked_sub(b)?
+        .abs();
     let d0_u = U256::try_from(d0).unwrap_or(U256::ZERO);
     let divider: I256 = if d0_u > p(48) {
         si(30)
@@ -213,29 +243,41 @@ pub fn get_y_3_ng(ann: U256, gamma: U256, x: [U256; 3], d: U256, i: usize) -> Op
         s(1)
     };
     let (a, b, c, d_coeff) = if a.abs() > b.abs() {
-        let ap = (a / b).abs();
+        let ap = a.checked_div(b)?.abs();
         (
-            a.wrapping_mul(ap) / divider,
-            (b * ap) / divider,
-            (c * ap) / divider,
-            (d_coeff * ap) / divider,
+            a.wrapping_mul(ap).checked_div(divider)?,
+            b.checked_mul(ap)?.checked_div(divider)?,
+            c.checked_mul(ap)?.checked_div(divider)?,
+            d_coeff.checked_mul(ap)?.checked_div(divider)?,
         )
     } else {
-        let ap = (b / a).abs();
+        let ap = b.checked_div(a)?.abs();
         (
-            a / ap / divider,
-            b / ap / divider,
-            c / ap / divider,
-            d_coeff / ap / divider,
+            a.checked_div(ap)?.checked_div(divider)?,
+            b.checked_div(ap)?.checked_div(divider)?,
+            c.checked_div(ap)?.checked_div(divider)?,
+            d_coeff.checked_div(ap)?.checked_div(divider)?,
         )
     };
     let _3ac = s(3).wrapping_mul(a).wrapping_mul(c);
-    let delta0 = _3ac / b - b;
-    let delta1 = s(3).wrapping_mul(_3ac) / b
-        - s(2).wrapping_mul(b)
-        - s(27).wrapping_mul(a.wrapping_mul(a)) / b * d_coeff / b;
-    let sqrt_arg =
-        delta1.wrapping_mul(delta1) + s(4).wrapping_mul(delta0.wrapping_mul(delta0)) / b * delta0;
+    let delta0 = _3ac.checked_div(b)?.checked_sub(b)?;
+    let delta1 = s(3)
+        .wrapping_mul(_3ac)
+        .checked_div(b)?
+        .checked_sub(s(2).wrapping_mul(b))?
+        .checked_sub(
+            s(27)
+                .wrapping_mul(a.wrapping_mul(a))
+                .checked_div(b)?
+                .checked_mul(d_coeff)?
+                .checked_div(b)?,
+        )?;
+    let sqrt_arg = delta1.wrapping_mul(delta1).checked_add(
+        s(4)
+            .wrapping_mul(delta0.wrapping_mul(delta0))
+            .checked_div(b)?
+            .checked_mul(delta0)?,
+    )?;
     if sqrt_arg <= I256::ZERO {
         let y = newton_y_3(ann, gamma, x, d, i)?;
         return Some((y, U256::ZERO));
@@ -262,11 +304,21 @@ pub fn get_y_3_ng(ann: U256, gamma: U256, x: [U256; 3], d: U256, i: usize) -> Op
         .wrapping_div(e18)
         .wrapping_mul(second_cbrt)
         .wrapping_div(e18);
-    let root_k0: I256 = (b + b * delta0 / c1 - c1) / s(3);
-    let root: I256 = d_s.wrapping_mul(d_s) / s(27) / x_k * d_s / x_j * root_k0 / a;
+    let root_k0: I256 = b
+        .checked_add(b.checked_mul(delta0)?.checked_div(c1)?)?
+        .checked_sub(c1)?
+        .checked_div(s(3))?;
+    let root: I256 = d_s
+        .wrapping_mul(d_s)
+        .checked_div(s(27))?
+        .checked_div(x_k)?
+        .checked_mul(d_s)?
+        .checked_div(x_j)?
+        .checked_mul(root_k0)?
+        .checked_div(a)?;
     let y_out = U256::try_from(root).ok()?;
-    let k0_prev = U256::try_from(e18.wrapping_mul(root_k0) / a).ok()?;
-    let frac = y_out * WAD / d;
+    let k0_prev = U256::try_from(e18.wrapping_mul(root_k0).checked_div(a)?).ok()?;
+    let frac = y_out.checked_mul(WAD)?.checked_div(d)?;
     if frac < p(16) - U256::from(1) || frac >= p(20) + U256::from(1) {
         return None;
     }
