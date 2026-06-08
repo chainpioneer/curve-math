@@ -224,6 +224,73 @@ impl TwoCryptoV1State {
         Some(ExchangeResult { dy, fee: fee_amount })
     }
 
+    /// Replay an on-chain TokenExchange event using the AUTHORITATIVE output
+    /// amount `dy` from the event, instead of re-simulating it via `exchange()`.
+    ///
+    /// On-chain, `_exchange` feeds `tweak_price` a price `p` and a post-swap
+    /// `xp` derived from the REAL `dy`. Re-deriving `dy` from a model state that
+    /// has even a few bps of drift produces a wildly wrong `p` for small swaps
+    /// (`dy` is a tiny difference of large numbers), which poisons the
+    /// `price_oracle` EMA and triggers a spurious `price_scale` repeg that
+    /// compounds. Because the indexer already knows the exact `dy`
+    /// (`tokens_bought`), we use it directly here so `last_prices` /
+    /// `price_oracle` / `price_scale` / `D` track on-chain wei-exactly.
+    ///
+    /// `dx` = `tokens_sold`, `dy` = `tokens_bought` (both native token units).
+    pub fn apply_exchange_event(
+        &mut self,
+        i: usize,
+        j: usize,
+        dx: U256,
+        dy: U256,
+        block_timestamp: u64,
+    ) -> Option<()> {
+        if i == j || i >= 2 || j >= 2 {
+            return None;
+        }
+        let a_gamma = [self.ann, self.gamma];
+        let price_scale = self.price_scale;
+        let prec_i = self.precisions[i];
+        let prec_j = self.precisions[j];
+
+        // Apply the authoritative balance deltas (matches the event exactly).
+        self.balances[i] = self.balances[i] + dx;
+        self.balances[j] = self.balances[j].checked_sub(dy)?;
+
+        // Mirror exchange()'s ramp bookkeeping: tweak_price clears
+        // future_a_gamma_time when it has reached 1.
+        let t = self.future_a_gamma_time;
+        if t > U256::ZERO && U256::from(block_timestamp) >= t {
+            self.future_a_gamma_time = U256::from(1u64);
+        }
+
+        // Post-swap xp in normalized space — identical to what on-chain
+        // `_exchange` passes into `tweak_price` (post-swap balances scaled).
+        let xp = [
+            self.balances[0] * self.precisions[0],
+            self.balances[1] * price_scale * self.precisions[1] / PRECISION,
+        ];
+
+        // Price for the oracle, computed from the AUTHORITATIVE dx/dy exactly as
+        // on-chain (`_exchange`): only when both legs exceed 1e5.
+        let p = if dx > U256::from(100_000u64) && dy > U256::from(100_000u64) {
+            let _dx = dx * prec_i;
+            let _dy = dy * prec_j;
+            if i == 0 {
+                _dx * WAD / _dy
+            } else {
+                _dy * WAD / _dx
+            }
+        } else {
+            U256::ZERO
+        };
+
+        // new_D = 0 → tweak_price recomputes D = newton_d(post-swap xp), exactly
+        // as on-chain when called from a swap.
+        self.tweak_price(a_gamma, xp, p, U256::ZERO, block_timestamp);
+        Some(())
+    }
+
     /// Apply add_liquidity: update balances, compute D, run tweak_price.
     /// `amounts` are the token amounts added (in native units).
     /// Returns the new D.
