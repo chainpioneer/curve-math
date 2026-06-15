@@ -293,14 +293,25 @@ impl TwoCryptoV1State {
 
     /// Apply add_liquidity: update balances, compute D, run tweak_price.
     /// `amounts` are the token amounts added (in native units).
+    /// `token_supply_post` is the LP total supply AFTER the mint (from the
+    /// AddLiquidity event) and `d_token` the LP minted (after fee,
+    /// = token_supply_post - token_supply_pre). Both are needed to reproduce the
+    /// on-chain `last_prices` for a single-sided add.
     /// Returns the new D.
-    pub fn apply_add_liquidity(&mut self, amounts: [U256; 2], block_timestamp: u64) -> Option<U256> {
+    pub fn apply_add_liquidity(
+        &mut self,
+        amounts: [U256; 2],
+        token_supply_post: U256,
+        d_token: U256,
+        block_timestamp: u64,
+    ) -> Option<U256> {
         let precisions = self.precisions;
         let price_scale = self.price_scale;
 
-        // Update balances
+        // Update balances (xx = post-add native balances, as on-chain).
         self.balances[0] = self.balances[0] + amounts[0];
         self.balances[1] = self.balances[1] + amounts[1];
+        let xx = self.balances;
 
         // Compute xp
         let xp = [
@@ -311,8 +322,53 @@ impl TwoCryptoV1State {
         // Compute new D
         let d = twocrypto_v1::newton_d(self.ann, self.gamma, xp)?;
 
+        // Price `p` for tweak_price, EXACTLY as on-chain `add_liquidity`
+        // (twocrypto v0.3.9 L966-985): 0 for a balanced add (tweak_price then
+        // uses the get_y spot price); for a SINGLE-SIDED add it is derived from
+        // the added amount and LP minted. The previous port passed 0 for every
+        // add, so single-sided adds got the spot price instead — a few-bps
+        // `last_prices` error that poisons the price_oracle EMA and, after a long
+        // inter-event gap, flips a price_scale rebalance, driving (balances, D)
+        // off the invariant manifold (the 2026-06-14 0x11c1fbd4 overflow storm).
+        let mut p = U256::ZERO;
+        if d_token > U256::from(100_000u64) && !token_supply_post.is_zero() {
+            if amounts[0].is_zero() || amounts[1].is_zero() {
+                let (s_bal, precision, ix) = if amounts[0].is_zero() {
+                    (xx[0] * precisions[0], precisions[1], 1usize)
+                } else {
+                    (xx[1] * precisions[1], precisions[0], 0usize)
+                };
+                // S = S * d_token / token_supply  (post-mint supply)
+                let s = s_bal * d_token / token_supply_post;
+                // denom = amounts[ix]*prec - d_token*xx[ix]*prec / token_supply
+                let minuend = amounts[ix] * precision;
+                let subtrahend = d_token * xx[ix] * precision / token_supply_post;
+                if minuend > subtrahend {
+                    let denom = minuend - subtrahend;
+                    if !denom.is_zero() {
+                        p = s * PRECISION / denom;
+                        if ix == 0 && !p.is_zero() {
+                            p = (PRECISION * PRECISION) / p;
+                        }
+                    }
+                }
+            }
+        }
+
+        // On-chain `add_liquidity` mints the LP tokens (token_supply += d_token)
+        // BEFORE calling tweak_price, so tweak_price's
+        //     virtual_price = WAD * xcp / total_supply
+        // uses the POST-mint supply. The previous port left total_supply at its
+        // pre-mint value during tweak_price, so virtual_price / xcp_profit were
+        // computed against a stale supply — wrong by the mint fraction. Those
+        // feed the price_scale rebalance trigger on the FOLLOWING swaps, so the
+        // error surfaced as a 1-bp price_scale drift a few events later. Set the
+        // post-mint supply here (token_supply_post = pre + d_token, the value the
+        // AddLiquidity event logs) so vp/xcp match on-chain.
+        self.total_supply = token_supply_post;
+
         // Run tweak_price with the new D (same as on-chain add_liquidity)
-        self.tweak_price([self.ann, self.gamma], xp, U256::ZERO, d, block_timestamp);
+        self.tweak_price([self.ann, self.gamma], xp, p, d, block_timestamp);
 
         Some(self.d)
     }
@@ -590,5 +646,62 @@ mod tests {
         // On-chain verified value from TwoCryptoV1 pool 0x11c1 on Base
         let expected = U256::from(920187657650015204u128);
         assert_eq!(result, expected, "halfpow(120e15) mismatch: got {result}, expected {expected}");
+    }
+
+    fn u(s: &str) -> U256 {
+        U256::from_str_radix(s, 10).unwrap()
+    }
+
+    /// Deterministic, RPC-free regression for the SINGLE-SIDED `add_liquidity`
+    /// price (`p`) computation — the bug behind the 2026-06-14 0x11c1fbd4
+    /// overflow storm. Captured from a real on-chain single-sided add (Base
+    /// block 47319347: +0.011 WETH, 0 cbETH; coin index ix=0, so the
+    /// `p = (10**18)**2 / p` inversion branch is exercised).
+    ///
+    /// With the previous port (`p = 0` → tweak_price used the get_y SPOT price)
+    /// `last_prices` came out ~3 bps off, which poisoned the price_oracle EMA
+    /// and later flipped a price_scale rebalance, driving (balances, D) off the
+    /// invariant manifold (get_y → garbage). With the on-chain amount-derived
+    /// `p` (twocrypto v0.3.9 L966-985) AND total_supply set post-mint before
+    /// tweak_price, every output below is wei-exact to on-chain.
+    #[test]
+    fn single_sided_add_liquidity_price_wei_exact() {
+        let mut ex = TwoCryptoV1State {
+            balances: [u("526022903304917687357"), u("441321396040500244393")],
+            price_scale: u("1132707533187792456"),
+            price_oracle: u("1132522327619919169"),
+            last_prices: u("1133168650765130913"),
+            last_prices_timestamp: 1781427767,
+            d: u("1025910595894288753611"),
+            virtual_price: u("1017099985349015694"),
+            xcp_profit: u("1024259019159156430"),
+            xcp_profit_a: u("1024247134574159019"),
+            admin_fee: u("5000000000"),
+            ann: u("20000000"),
+            gamma: u("10000000000000000"),
+            mid_fee: u("3000000"),
+            out_fee: u("45000000"),
+            fee_gamma: u("300000000000000000"),
+            precisions: [u("1"), u("1")],
+            total_supply: u("473867558260735343659"),
+            allowed_extra_profit: u("10000000000"),
+            adjustment_step: u("5500000000000"),
+            ma_half_time: u("600"),
+            not_adjusted: true,
+            future_a_gamma_time: u("0"),
+            eth_variant: true,
+        };
+        // Single-sided add: only coin 0 (WETH) added.
+        let amounts = [u("11000000000000000"), u("0")];
+        let token_supply_post = u("473872638156572438955");
+        let d_token = u("5079895837095296");
+        let block_ts = 1781428041u64;
+
+        ex.apply_add_liquidity(amounts, token_supply_post, d_token, block_ts);
+
+        // On-chain state at block 47319347 (BlockPI archive), wei-exact.
+        assert_eq!(ex.last_prices, u("1133163518856988409"), "last_prices");
+        assert_eq!(ex.price_scale, u("1132701303296359923"), "price_scale");
+        assert_eq!(ex.d, u("1025918846068038311390"), "D");
     }
 }
